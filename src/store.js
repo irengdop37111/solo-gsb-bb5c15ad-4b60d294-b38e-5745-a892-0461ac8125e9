@@ -1,6 +1,7 @@
 'use strict';
 // 业务核心：导入、提议、采纳/驳回、冲突标记、发布合版、版本视图、异议引用、基版过期提议的续提
 const { codeLength, sliceCP, validateRange, overlaps, applyEdits, transformRange, transformRangeRebase, editTouchesAnchor, replayProvenance } = require('./text');
+const att = require('./attachments');
 
 // ---------- 解析 ----------
 // 行首段号格式： 12. 文字 / 12、文字 / 12 制表符或空格 + 文字；单独一行 "12" 视为空文段。
@@ -123,6 +124,189 @@ function listSecretLogs(db) {
     )
     .all();
 }
+
+// ---------- 提议依据附件 ----------
+function attachmentRow(db, id) {
+  return db
+    .prepare(
+      `SELECT a.*, u.display_name AS uploader_name, u.username AS uploader_user, p.status AS proposal_status
+       FROM proposal_attachments a
+       JOIN users u ON u.id = a.uploaded_by
+       JOIN proposals p ON p.id = a.proposal_id
+       WHERE a.id = ?`
+    )
+    .get(id);
+}
+
+// 附件是否对当前查看者可见：参与者在任何视图（含保密段/历史视图）都不得获得
+// 附件元数据、内容或下载地址；记录员只能看到本人上传；复核员可查看全部。
+function canSeeAttachment(viewer, row) {
+  if (!viewer) return false;
+  if (viewer.role === 'reviewer') return true;
+  if (viewer.role === 'recordist') return row.uploaded_by === viewer.id;
+  return false;
+}
+
+function attachmentMeta(row) {
+  return {
+    id: row.id,
+    proposalId: row.proposal_id,
+    displayName: row.display_name,
+    mediaType: row.media_type,
+    mime: row.mime_type,
+    size: row.size_bytes,
+    expectedSha256: row.expected_sha256,
+    actualSha256: row.actual_sha256,
+    sha256Matched: row.expected_sha256 === row.actual_sha256,
+    frozen: row.proposal_status !== 'pending',
+    uploadedBy: { id: row.uploaded_by, name: row.uploader_name, username: row.uploader_user },
+    uploadedAt: row.uploaded_at,
+    url: `/api/attachments/${row.id}/download`,
+  };
+}
+
+// 取一批提议的可见附件（一次查询，按提议分组）；参与者返回空映射
+function attachmentsByProposal(db, viewer, proposalIds) {
+  const map = new Map(proposalIds.map((id) => [id, []]));
+  if (!viewer || viewer.role === 'participant' || proposalIds.length === 0) return map;
+  const placeholders = proposalIds.map(() => '?').join(',');
+  const rows = db
+    .prepare(
+      `SELECT a.*, u.display_name AS uploader_name, u.username AS uploader_user, p.status AS proposal_status
+       FROM proposal_attachments a
+       JOIN users u ON u.id = a.uploaded_by
+       JOIN proposals p ON p.id = a.proposal_id
+       WHERE a.proposal_id IN (${placeholders})
+       ORDER BY a.id`
+    )
+    .all(...proposalIds);
+  for (const row of rows) {
+    if (!canSeeAttachment(viewer, row)) continue; // 记录员看不到他人附件
+    map.get(row.proposal_id).push(attachmentMeta(row));
+  }
+  return map;
+}
+
+// 上传依据文件：全部校验通过后在同一个数据库事务内复查提议状态并落库；
+// 任一环节失败都明确报错、不留半成品或孤儿文件。
+function addAttachment(db, actor, proposalId, { buffer, displayName, expectedSha256 }) {
+  if (!Number.isInteger(proposalId)) throw badRequest('缺少有效的提议 id');
+  const name = typeof displayName === 'string' ? displayName.trim() : '';
+  if (!name) throw badRequest('缺少原始文件名：请通过 X-Attachment-Filename 头提交（UTF-8，请百分号编码）', 'NO_FILENAME');
+  if (name.length > 255) throw badRequest('文件名过长（最多 255 个字符）', 'FILENAME_TOO_LONG');
+  if (!Buffer.isBuffer(buffer)) throw badRequest('缺少文件内容（请求体须为文件的原始字节）', 'EMPTY_FILE');
+
+  const p = db.prepare('SELECT * FROM proposals WHERE id=?').get(proposalId);
+  if (!p) throw notFound(`提议 #${proposalId} 不存在，无法上传依据文件`);
+  // 归属先校验（无权者不获得提议状态以外的任何信息）；最终状态在写事务内复查
+  if (p.created_by !== actor.id) {
+    throw forbidden(`无权操作：只能为本人提交的待复核提议 #${proposalId} 上传依据文件`);
+  }
+  if (p.status !== 'pending') {
+    throw conflict(`提议 #${proposalId} 已“${p.status}”，附件集合已冻结，不能再上传；仅待复核提议可补充依据`, 'PROPOSAL_FROZEN');
+  }
+
+  if (buffer.length === 0) throw badRequest('文件内容为空，拒绝上传（不产生附件记录）', 'EMPTY_FILE');
+  if (buffer.length > att.MAX_BYTES) {
+    throw Object.assign(
+      new Error(`文件超过大小限制：单件不超过 ${att.formatBytes(att.MAX_BYTES)}，本次 ${att.formatBytes(buffer.length)}；已拒绝，未保存任何内容`),
+      { status: 413, code: 'FILE_TOO_LARGE' }
+    );
+  }
+  const type = att.sniffMediaType(buffer);
+  if (!type) {
+    throw badRequest(
+      '文件内容无法识别：仅接收内容可识别的 PDF、PNG、JPEG、MP3 或 WAV（按文件头判定，改后缀名无效）；已拒绝，未保存任何内容',
+      'UNSUPPORTED_MEDIA_TYPE'
+    );
+  }
+  const digest = att.sha256(buffer);
+  const want = String(expectedSha256 || '').trim().toLowerCase();
+  if (!/^[0-9a-f]{64}$/.test(want)) {
+    throw badRequest('缺少有效的预期 SHA-256：请通过 X-Attachment-SHA256 头提交 64 位十六进制摘要', 'NO_SHA256');
+  }
+  if (want !== digest) {
+    throw Object.assign(
+      new Error(`SHA-256 摘要不符：提交的预期摘要与文件实际内容不一致（实际 ${digest}）；已拒绝，未保存任何内容`),
+      { status: 422, code: 'SHA256_MISMATCH', expected: want, actual: digest }
+    );
+  }
+
+  // 事务内最终复查状态（防止“校验期间提议被采纳/驳回/标记冲突/发布”）；
+  // 先把整文件写入临时文件并原子改名，INSERT 失败时立即清除，避免孤儿文件。
+  let storedName = null;
+  const result = db.transaction(() => {
+    const cur = db.prepare('SELECT status, created_by FROM proposals WHERE id=?').get(proposalId);
+    if (cur.status !== 'pending') {
+      throw conflict(`提议 #${proposalId} 状态已变为“${cur.status}”，附件集合冻结，本次上传取消（未保存文件）`, 'PROPOSAL_FROZEN');
+    }
+    if (cur.created_by !== actor.id) {
+      throw forbidden(`无权操作：提议 #${proposalId} 非本人提交`);
+    }
+    storedName = att.newStoredName(proposalId, type.ext);
+    att.writeAttachment(storedName, buffer);
+    const r = db.prepare(
+      `INSERT INTO proposal_attachments
+        (proposal_id, display_name, stored_name, media_type, mime_type, size_bytes,
+         expected_sha256, actual_sha256, uploaded_by)
+       VALUES (?,?,?,?,?,?,?,?,?)`
+    ).run(proposalId, name, storedName, type.mediaType, type.mime, buffer.length, want, digest, actor.id);
+    return r.lastInsertRowid;
+  });
+
+  let id;
+  try {
+    id = result();
+  } catch (e) {
+    if (storedName) {
+      try { att.removeAttachment(storedName); } catch (_) { /* 已在失败路径尽力清理 */ }
+    }
+    throw e;
+  }
+  return attachmentMeta(attachmentRow(db, id));
+}
+
+// 删除误传附件：仅待复核提议、上传者本人；冻结后一律拒绝。
+function deleteAttachment(db, actor, attachmentId) {
+  if (!Number.isInteger(attachmentId)) throw badRequest('缺少有效的附件 id');
+  const row = db.prepare('SELECT * FROM proposal_attachments WHERE id=?').get(attachmentId);
+  if (!row) throw notFound(`附件 #${attachmentId} 不存在`);
+  if (row.uploaded_by !== actor.id) {
+    // 对无权者不暴露附件是否存在：统一按不存在处理
+    throw notFound(`附件 #${attachmentId} 不存在`);
+  }
+  const p = db.prepare('SELECT status FROM proposals WHERE id=?').get(row.proposal_id);
+  if (p.status !== 'pending') {
+    throw conflict(`提议 #${row.proposal_id} 已“${p.status}”，附件集合冻结，不能删除`, 'PROPOSAL_FROZEN');
+  }
+  db.transaction(() => {
+    // 事务内以最终提议状态为准（并发复核可能刚使提议离开 pending）
+    const cur = db.prepare('SELECT status FROM proposals WHERE id=?').get(row.proposal_id);
+    if (cur.status !== 'pending') {
+      throw conflict(`提议 #${row.proposal_id} 状态已变为“${cur.status}”，附件集合冻结，删除取消`, 'PROPOSAL_FROZEN');
+    }
+    db.prepare('DELETE FROM proposal_attachments WHERE id=?').run(attachmentId);
+    try {
+      att.removeAttachment(row.stored_name);
+    } catch (e) {
+      // 文件缺失等存储异常：回滚删除，避免数据库与磁盘不一致
+      throw Object.assign(new Error(`删除附件文件失败（附件记录保留）：${e.message}`), { status: 500, code: 'STORAGE_ERROR' });
+    }
+  })();
+}
+
+// 下载授权校验：返回含磁盘路径的附件行；未登录/无权/不存在分别明确报错。
+function authorizeDownload(db, viewer, attachmentId) {
+  if (!Number.isInteger(attachmentId)) throw badRequest('缺少有效的附件 id');
+  const row = attachmentRow(db, attachmentId);
+  if (!row) throw notFound(`附件 #${attachmentId} 不存在`);
+  if (!canSeeAttachment(viewer, row)) {
+    // 参与者及非上传者记录员：不获得附件存在性、元数据或下载地址
+    throw notFound(`附件 #${attachmentId} 不存在`);
+  }
+  return row;
+}
+
 // ---------- 导入 ----------
 function importTranscript(db, actor, title, text) {
   if (getDoc(db)) throw conflict('逐字稿已导入并已发布初始版本，不能重复导入', 'ALREADY_INITIALIZED');
@@ -896,6 +1080,9 @@ function boothView(db, viewer) {
   // 参与者视角：保密段正文替换为占位；该段暂存修订整条剔除（不泄露段内替换文字）
   const maskSeg = (s) => (staff || !secrets.has(s.seg) ? s : { seg: s.seg, text: SECRET_PLACEHOLDER, secret: true });
   const segments = rawSegments.map(maskSeg);
+  const proposalRows = listProposals(db, viewer);
+  // 附件按权限随提议下发：参与者字段整体缺省；记录员仅含本人上传；复核员全部可见
+  const attachmentListByProposal = attachmentsByProposal(db, viewer, proposalRows.map((p) => p.id));
   const view = {
     initialized: true,
     title: doc.title,
@@ -913,7 +1100,12 @@ function boothView(db, viewer) {
       ? previewSegments(rawSegments, stage)
       : previewSegments(rawSegments, stage.filter((p) => !secrets.has(p.seg)))
     ).map(maskSeg),
-    proposals: listProposals(db, viewer),
+    proposals: staff
+      ? proposalRows.map((p) => ({
+          ...p,
+          attachments: attachmentListByProposal.get(p.id) || [],
+        }))
+      : proposalRows, // 参与者：不附带任何附件元数据
     objections: listObjections(db, viewer),
     versions: db
       .prepare(
@@ -977,6 +1169,14 @@ function versionView(db, id, viewer) {
     responses = responses.filter((r) => !secrets.has(r.seg));
   }
   responses = responses.map((r) => ({ ...r, proposalIds: JSON.parse(r.proposal_ids_json) }));
+  // 历史视图中的附件同样按权限下发：随提议及历史决议保留，参与者不获得任何附件字段
+  if (staff) {
+    const pids = [...new Set(decisions.map((d) => d.proposal_id).filter((x) => x != null))];
+    const attMap = attachmentsByProposal(db, viewer, pids);
+    decisions = decisions.map((d) =>
+      d.proposal_id == null ? d : { ...d, attachments: attMap.get(d.proposal_id) || [] }
+    );
+  }
   return {
     id: v.id,
     note: staff ? v.note : '', // 参与者不显示版本备注
@@ -1100,4 +1300,10 @@ module.exports = {
   getDoc,
   latestVersion,
   segmentsOf,
+  addAttachment,
+  deleteAttachment,
+  authorizeDownload,
+  attachmentsByProposal,
+  attachmentMeta,
+  canSeeAttachment,
 };

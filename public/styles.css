@@ -501,3 +501,90 @@ body {
 }
 .toast.error { background: #7a2e25; }
 .toast.success { background: var(--primary-dark); }
+
+/* ---------- 依据附件 ---------- */
+.att-block {
+  margin-top: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #faf9f4;
+}
+.att-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px;
+  margin-bottom: 6px;
+  font-size: 13px;
+}
+.att-frozen, .att-frozen-tag { color: var(--warn); font-size: 12px; }
+.att-frozen-tag {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 0 6px;
+  border: 1px solid var(--relo-border);
+  border-radius: 4px;
+  background: var(--relo-bg);
+}
+.att-list { display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.att-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 6px 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #fff;
+}
+.att-icon { font-size: 18px; line-height: 1.5; }
+.att-info { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.att-name { font-weight: 600; color: var(--primary-dark); word-break: break-all; }
+.att-hash {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+  color: var(--muted);
+  word-break: break-all;
+}
+.att-actions { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
+.att-audio { height: 30px; max-width: 220px; }
+.att-upload-row { margin-top: 8px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.att-add { cursor: pointer; }
+.att-msg { font-size: 12px; }
+.att-msg.att-ok { color: var(--primary-dark); }
+.att-msg.att-err { color: var(--danger); }
+.att-empty { font-size: 12px; margin: 2px 0 6px; }
+.att-compact {
+  margin-top: 6px;
+  font-size: 12px;
+  color: var(--muted);
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 8px;
+  align-items: center;
+}
+.att-chip {
+  display: inline-block;
+  padding: 0 8px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: #f4f3ef;
+  color: var(--primary-dark);
+  text-decoration: none;
+  max-width: 240px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.att-chip:hover { background: #e9ece0; }
+.att-preview-img {
+  display: block;
+  max-width: 100%;
+  max-height: 60vh;
+  margin: 10px auto;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}

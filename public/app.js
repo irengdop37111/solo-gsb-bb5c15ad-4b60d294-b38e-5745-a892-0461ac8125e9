@@ -10,6 +10,156 @@ const esc = (s) =>
     ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])
   );
 
+// ---------- 依据附件 ----------
+function fmtSize(n) {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / 1024 / 1024).toFixed(2)} MB`;
+}
+const MEDIA_ICON = { pdf: '📄', png: '🖼️', jpeg: '🖼️', mp3: '🎵', wav: '🎵' };
+
+// 浏览器端计算文件内容的 SHA-256（与服务端实算摘要口径一致，提交的是“预期摘要”）
+async function sha256Hex(file) {
+  const buf = await file.arrayBuffer();
+  if (window.crypto && window.crypto.subtle) {
+    const digest = await window.crypto.subtle.digest('SHA-256', buf);
+    return { hex: Array.from(new Uint8Array(digest)).map((b) => b.toString(16).padStart(2, '0')).join(''), buf };
+  }
+  throw new Error('当前浏览器不支持 SubtleCrypto，无法计算 SHA-256，请换用现代浏览器');
+}
+
+// 上传请求体为文件原始字节（非 JSON），原始文件名与预期摘要走请求头
+async function uploadAttachment(proposalId, file, hex) {
+  const res = await fetch(`/api/proposals/${proposalId}/attachments`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/octet-stream',
+      'X-Attachment-Filename': encodeURIComponent(file.name),
+      'X-Attachment-SHA256': hex,
+    },
+    body: file,
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw Object.assign(new Error((data && data.error) || `上传失败（${res.status}）`), { status: res.status });
+  return data.attachment;
+}
+
+async function deleteAttachmentRequest(id) {
+  await api(`/api/attachments/${id}`, { method: 'DELETE' });
+}
+
+// 附件列表区块（卡片/详情共用）：记录员仅看到本人附件，复核员看到全部；参与者不渲染
+function attachmentBlockHtml(p, opts = {}) {
+  if (!me || me.role === 'participant') return '';
+  const list = p.attachments || [];
+  const canUpload = opts.inModal && me.role === 'recordist' &&
+    p.creator_user === me.username && p.status === 'pending';
+  const head = `<div class="att-head"><b>依据附件（${list.length}）</b>${
+    p.status === 'pending'
+      ? '<span class="muted">仅待复核期间可增删，采纳/驳回/标记冲突/发布后冻结</span>'
+      : '<span class="att-frozen">🔒 附件集合已冻结，随提议永久保留</span>'
+  }</div>`;
+  const items = list.length
+    ? `<div class="att-list">${list.map((a) => `
+        <div class="att-item" data-att="${a.id}">
+          <span class="att-icon">${MEDIA_ICON[a.mediaType] || '📎'}</span>
+          <span class="att-info">
+            <a class="att-name" href="${a.url}" target="_blank" rel="noopener" title="下载/打开（含服务端校验信息）">${esc(a.displayName)}</a>
+            <span class="card-meta">${esc(a.mediaType.toUpperCase())} · ${fmtSize(a.size)} · ${esc(a.uploadedBy.name)}（${esc(a.uploadedBy.username)}）· ${a.uploadedAt} UTC</span>
+            <span class="att-hash" title="服务端实算 SHA-256（与提交的预期摘要一致）">SHA-256：${a.actualSha256.slice(0, 16)}…${a.actualSha256.slice(-8)} ${a.sha256Matched ? '✔ 校验一致' : '⚠ 不符'}</span>
+            ${a.frozen ? '<span class="att-frozen-tag">已冻结</span>' : ''}
+          </span>
+          <span class="att-actions">
+            ${renderAttPreview(a)}
+            ${!a.frozen && a.uploadedBy.id === me.id
+              ? '<button class="btn tiny danger" data-att-del="' + a.id + '">删除误传</button>' : ''}
+          </span>
+        </div>`).join('')}</div>`
+    : '<div class="muted att-empty">尚无依据附件。</div>';
+  const uploader = canUpload
+    ? `<label class="btn small primary att-add">＋ 上传依据文件
+         <input type="file" hidden
+           accept="application/pdf,image/png,image/jpeg,audio/mpeg,audio/wav,.pdf,.png,.jpg,.jpeg,.mp3,.wav"
+           data-att-upload="${p.id}" />
+       </label><span class="att-msg" data-att-msg></span>`
+    : '';
+  return `<div class="att-block" data-att-block="${p.id}">${head}${items}${uploader ? `<div class="att-upload-row">${uploader}</div>` : ''}</div>`;
+}
+
+// PDF/图片/音频在网页内直接预览授权内容（音频带 controls；PDF/图片新标签打开由浏览器渲染）
+function renderAttPreview(a) {
+  if (a.mediaType === 'mp3' || a.mediaType === 'wav') {
+    return `<audio class="att-audio" controls preload="none" src="${a.url}"></audio>`;
+  }
+  if (a.mediaType === 'png' || a.mediaType === 'jpeg') {
+    return `<button class="btn tiny" data-att-view="${a.id}">预览</button>`;
+  }
+  return '';
+}
+
+function bindAttachmentHandlers(root, afterChange) {
+  if (!root) return;
+  $$('[data-att-upload]', root).forEach((input) => {
+    input.addEventListener('change', () => onUploadFiles(input, afterChange), { once: true });
+  });
+  $$('[data-att-del]', root).forEach((btn) =>
+    btn.addEventListener('click', async () => {
+      const id = parseInt(btn.dataset.attDel, 10);
+      if (!window.confirm('确认删除该误传附件？删除后不可恢复（仅提议待复核期间允许）。')) return;
+      try {
+        await deleteAttachmentRequest(id);
+        toast('附件已删除', 'success');
+        await reload();
+        if (afterChange) afterChange();
+      } catch (err) { toast(err.message, 'error'); await reload(); }
+    }));
+  $$('[data-att-view]', root).forEach((btn) =>
+    btn.addEventListener('click', () => {
+      const a = findAttachment(parseInt(btn.dataset.attView, 10));
+      if (a) openImagePreview(a);
+    }));
+}
+
+function findAttachment(id) {
+  for (const p of booth.proposals || []) {
+    const a = (p.attachments || []).find((x) => x.id === id);
+    if (a) return a;
+  }
+  return null;
+}
+
+function openImagePreview(a) {
+  openModal(`
+    <h3>${esc(a.displayName)}</h3>
+    <div class="card-meta">${esc(a.mediaType.toUpperCase())} · ${fmtSize(a.size)} · ${esc(a.uploadedBy.name)}（${esc(a.uploadedBy.username)}）</div>
+    <img class="att-preview-img" src="${a.url}" alt="${esc(a.displayName)}" />
+    <div class="att-hash">SHA-256：${a.actualSha256} ${a.sha256Matched ? '✔ 校验一致' : '⚠ 不符'}</div>
+    <div class="actions"><a class="btn" href="${a.url}" target="_blank" rel="noopener">新标签打开</a><button class="btn" data-close>关闭</button></div>`);
+}
+
+async function onUploadFiles(input, afterChange) {
+  const proposalId = parseInt(input.dataset.attUpload, 10);
+  const block = input.closest('[data-att-block]');
+  const msgEl = block && block.querySelector('[data-att-msg]');
+  const files = Array.from(input.files || []);
+  if (!files.length) return;
+  for (const file of files) {
+    if (msgEl) { msgEl.textContent = `正在校验并上传：${file.name}（${fmtSize(file.size)}）…`; msgEl.className = 'att-msg muted'; }
+    try {
+      const { hex } = await sha256Hex(file);
+      const a = await uploadAttachment(proposalId, file, hex);
+      if (msgEl) { msgEl.textContent = `✔ ${a.displayName} 已上传，SHA-256 校验一致`; msgEl.className = 'att-msg att-ok'; }
+      toast(`附件“${a.displayName}”已上传，SHA-256 校验一致`, 'success');
+      await reload();
+      if (afterChange) afterChange();
+      return; // reload 后 DOM 重建，剩余文件不再继续（input 已被新表单取代）
+    } catch (err) {
+      if (msgEl) { msgEl.textContent = `✘ ${file.name}：${err.message}`; msgEl.className = 'att-msg att-err'; }
+      toast(`上传失败：${err.message}`, 'error');
+    }
+  }
+}
+
 let me = null;
 let booth = null;
 let tab = 'proposals';
@@ -521,6 +671,7 @@ function openProposalModal(id) {
     <div class="quote">${esc(p.original_excerpt)}</div>
     <div><span class="arrow">替换为 →</span><span class="replacement">${esc(p.replacement) || '（空串·删除）'}</span>${same ? ' <span class="muted">（与原文相同）</span>' : ''}</div>
     <div class="basis" style="margin-top:8px"><b>依据：</b>${esc(p.basis)}</div>
+    ${attachmentBlockHtml(p, { inModal: true })}
     ${p.conflict_reason ? `<div class="conflict-reason">冲突原因：${esc(p.conflict_reason)}</div>` : ''}
     <div class="actions">
       <button class="btn" data-close>关闭</button>
@@ -528,6 +679,8 @@ function openProposalModal(id) {
       ${actionable && p.status === 'adopted' ? '<button class="btn danger" id="p-reject">驳回（移出暂存区）</button>' : ''}
       ${canRebase(p) ? '<button class="btn primary" id="p-rebase">续提到当前版本…</button>' : ''}
     </div>`);
+
+  bindAttachmentHandlers($('#modal-box'), () => openProposalModal(id));
 
   const rebaseBtn = $('#p-rebase');
   if (rebaseBtn) rebaseBtn.addEventListener('click', () => openRebase(p.id));
@@ -747,6 +900,11 @@ function renderProposals() {
       <div class="quote">${esc(p.original_excerpt)}</div>
       <div><span class="arrow">→</span><span class="replacement">${esc(p.replacement) || '（删除）'}</span></div>
       <div class="basis"><b>依据：</b>${esc(p.basis)}</div>
+      ${me.role !== 'participant' && (p.attachments || []).length ? `
+      <div class="att-compact">📎 依据附件 ${(p.attachments || []).length} 件：
+        ${p.attachments.map((a) => `<a class="att-chip" href="${a.url}" target="_blank" rel="noopener"
+            title="${esc(a.displayName)} · ${fmtSize(a.size)} · SHA-256 ${a.actualSha256}">${MEDIA_ICON[a.mediaType] || '📎'} ${esc(a.displayName)}</a>`).join(' ')}
+      </div>` : ''}
       ${p.conflict_reason ? `<div class="conflict-reason">${esc(p.conflict_reason)}</div>` : ''}
       ${canReview ? `
       <div class="card-actions">
@@ -881,6 +1039,9 @@ function showVersionModal(v) {
             ${d.proposal_id ? `· 提议 #${d.proposal_id}（第 ${d.seg} 段 [${d.start_cp},${d.end_cp})，提出人 ${esc(d.proposal_creator || '')}）` : ''}
             ${d.version_id ? `· 版本 v${d.version_id}` : ''}
             ${d.reason ? ` — ${esc(d.reason)}` : ''}
+            ${(d.attachments || []).length ? `<div class="att-compact">📎 冻结附件 ${d.attachments.length} 件（随提议与历史决议保留）：
+              ${d.attachments.map((a) => `<a class="att-chip" href="${a.url}" target="_blank" rel="noopener"
+                title="${esc(a.displayName)} · ${fmtSize(a.size)} · SHA-256 ${a.actualSha256}">${MEDIA_ICON[a.mediaType] || '📎'} ${esc(a.displayName)}</a>`).join(' ')}</div>` : ''}
             <div class="card-meta">${esc(d.actor_name || '系统')} · ${d.created_at} UTC</div>
           </div>`).join('') : '<p class="muted">初始版本无决议。</p>'}
       </div>

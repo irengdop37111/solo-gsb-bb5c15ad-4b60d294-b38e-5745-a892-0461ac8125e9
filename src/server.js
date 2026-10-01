@@ -1,9 +1,11 @@
 'use strict';
 const path = require('path');
+const fs = require('fs');
 const express = require('express');
 const { openDb, verifyPassword } = require('./db');
 const { currentUser, requireAuth, requireRole, createSession, destroySession } = require('./auth');
 const store = require('./store');
+const att = require('./attachments');
 
 const PORT = parseInt(process.env.PORT || '3000', 10);
 const HOST = process.env.HOST || '0.0.0.0';
@@ -152,6 +154,88 @@ app.get('/api/versions/:id/sources/:seg', requireAuth, wrap((req, res) => {
     parseInt(req.params.seg, 10),
     req.user
   ));
+}));
+
+// ---------- 提议依据附件 ----------
+// 上传：请求体为文件原始字节（application/octet-stream，或任意非 JSON 类型），
+// 原始文件名与预期 SHA-256 经请求头提交。仅记录员、且仅对本人“待复核”提议。
+const uploadRaw = express.raw({
+  type: () => true,
+  limit: att.MAX_BYTES + 1, // 越限由 body-parser 中断请求并进入下方 413 处理
+});
+
+app.post(
+  '/api/proposals/:id/attachments',
+  requireRole('recordist'),
+  (req, res, next) => {
+    const ct = (req.headers['content-type'] || '').toLowerCase();
+    if (ct.includes('application/json')) {
+      return res.status(400).json({
+        error: '上传请求体必须是文件的原始字节，而非 JSON；请直接发送文件内容并设置 X-Attachment-Filename / X-Attachment-SHA256 请求头',
+        code: 'BAD_CONTENT_TYPE',
+      });
+    }
+    next();
+  },
+  uploadRaw,
+  (err, req, res, next) => {
+    // body-parser 超限：明确报错，不产生附件记录或落盘文件
+    if (err && err.type === 'entity.too.large') {
+      return res.status(413).json({
+        error: `文件超过大小限制：单件不超过 ${att.formatBytes(att.MAX_BYTES)}；上传已拒绝，未保存任何内容`,
+        code: 'FILE_TOO_LARGE',
+        limitBytes: att.MAX_BYTES,
+        receivedBytes: err.length || null,
+      });
+    }
+    return next(err);
+  },
+  wrap((req, res) => {
+    let displayName = req.headers['x-attachment-filename'];
+    if (displayName) {
+      try { displayName = decodeURIComponent(displayName); }
+      catch (_) { /* 保留原样，后续 trim 校验 */ }
+    }
+    const meta = store.addAttachment(db, req.user, parseInt(req.params.id, 10), {
+      buffer: Buffer.isBuffer(req.body) ? req.body : null,
+      displayName,
+      expectedSha256: req.headers['x-attachment-sha256'],
+    });
+    res.status(201).json({ ok: true, attachment: meta });
+  })
+);
+
+// 删除误传附件：仅上传者本人且提议仍待复核；冻结后 409
+app.delete('/api/attachments/:aid', requireRole('recordist'), wrap((req, res) => {
+  store.deleteAttachment(db, req.user, parseInt(req.params.aid, 10));
+  res.json({ ok: true });
+}));
+
+// 下载依据文件：复核员可下载全部，记录员仅限本人上传，参与者一律 404
+// （不获得元数据、内容或下载地址，保密段与历史视图同样遵守）。
+app.get('/api/attachments/:aid/download', requireAuth, wrap((req, res) => {
+  const row = store.authorizeDownload(db, req.user, parseInt(req.params.aid, 10));
+  const filePath = att.attachmentPath(row.stored_name);
+  if (!att.attachmentExists(row.stored_name)) {
+    return res.status(500).json({ error: '附件文件在存储中缺失（元数据保留），请联系管理员核对数据卷', code: 'STORAGE_MISSING' });
+  }
+  const stat = fs.statSync(filePath);
+  const fallback = `attachment-${row.id}-${row.media_type}.${
+    row.media_type === 'jpeg' ? 'jpg' : row.media_type
+  }`;
+  const asciiName = (row.display_name.replace(/[^\x21-\x7e]/g, '_').replace(/["\\]/g, '_').trim() || fallback);
+  res.setHeader('Content-Type', row.mime_type);
+  res.setHeader('Content-Length', stat.size);
+  res.setHeader('X-Attachment-SHA256', row.actual_sha256);
+  res.setHeader('Content-Disposition',
+    `inline; filename="${asciiName}"; filename*=UTF-8''${encodeURIComponent(row.display_name)}`);
+  const stream = fs.createReadStream(filePath);
+  stream.on('error', (e) => {
+    console.error('[attachment] 读取失败：', e);
+    if (!res.headersSent) res.status(500).json({ error: '读取附件文件失败', code: 'STORAGE_ERROR' });
+    else res.destroy(e);
+  });
+  stream.pipe(res);
 }));
 
 // ---------- 静态前端 ----------

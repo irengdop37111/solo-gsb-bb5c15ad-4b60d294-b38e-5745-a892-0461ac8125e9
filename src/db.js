@@ -159,6 +159,25 @@ function initSchema(db) {
     seg INTEGER PRIMARY KEY
   );
 
+  -- 提议依据附件：记录员为本人“待复核(pending)”提议上传；文件名仅展示，落盘名随机。
+  -- 提议离开 pending（采纳/驳回/标记冲突/发布）后集合冻结：只可下载，不再增删；
+  -- 记录随提议与历史决议永久保留；续提生成的新提议不继承旧附件。
+  CREATE TABLE IF NOT EXISTS proposal_attachments (
+    id           INTEGER PRIMARY KEY,
+    proposal_id  INTEGER NOT NULL REFERENCES proposals(id),
+    display_name TEXT NOT NULL,                -- 提交时的原始文件名（仅展示）
+    stored_name  TEXT NOT NULL UNIQUE,         -- 落盘相对名：<proposalId>/<随机>.<规范后缀>
+    media_type   TEXT NOT NULL,                -- pdf | png | jpeg | mp3 | wav（按内容嗅探）
+    mime_type    TEXT NOT NULL,
+    size_bytes   INTEGER NOT NULL,
+    expected_sha256 TEXT NOT NULL,             -- 提交者预期摘要
+    actual_sha256   TEXT NOT NULL,             -- 服务端实算摘要（预期必须与之相等才落库）
+    uploaded_by  INTEGER NOT NULL REFERENCES users(id),
+    uploaded_at  TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+  CREATE INDEX IF NOT EXISTS idx_attachments_proposal ON proposal_attachments(proposal_id, id);
+  CREATE INDEX IF NOT EXISTS idx_attachments_uploader ON proposal_attachments(uploaded_by);
+
   -- 保密/解除保密操作留痕：操作人、时间与前后状态
   CREATE TABLE IF NOT EXISTS secret_logs (
     id          INTEGER PRIMARY KEY,

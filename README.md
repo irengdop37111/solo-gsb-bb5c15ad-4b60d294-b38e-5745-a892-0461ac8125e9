@@ -11,6 +11,12 @@
 片段文字与来源（初始导入，或最后写入该片段的已发布提议编号与发布版本）；来源沿逐次发布的修订
 几何重放得到，未触及文字保留原来源、替换/插入归本次提议、删除不占结果——不按同文搜索猜测。
 
+**记录员可为本人“待复核”的修订提议上传依据文件**：提交原始文件名与预期 SHA-256，服务端只按内容
+接收可识别的 PDF、PNG、JPEG、MP3、WAV（单件 ≤ 20 MB），并比对实际摘要；待复核期间可删除误传附件，
+提议一经采纳、驳回、标记冲突或发布，附件集合即冻结，原文件随提议与历史决议保留、重启后仍可查阅，
+续提的新提议不继承旧附件。复核员可查看全部附件，记录员只能查看本人上传，参与者不得获得任何附件
+元数据、内容或下载地址（保密段与历史视图同样遵守）。
+
 技术栈：Node.js（Express）+ SQLite（better-sqlite3）+ 无构建浏览器原生前端。
 
 ---
@@ -94,6 +100,8 @@ npm test
 | `SEED_RECORDIST_USER` / `SEED_RECORDIST_PASS` | `recorder` / `recorder123` | 记录员种子账户 |
 | `SEED_REVIEWER_USER` / `SEED_REVIEWER_PASS` | `reviewer` / `reviewer123` | 复核员种子账户 |
 | `SEED_PARTICIPANT_USER` / `SEED_PARTICIPANT_PASS` | `participant` / `participant123` | 参与者种子账户 |
+| `ATTACHMENT_DIR` | `$DATA_DIR/attachments`（本地）/ `/data/attachments`（容器） | 依据文件落盘目录（相对存储名 `<提议号>/<随机名>.<后缀>`）；默认在数据卷内，随卷持久、重启可查 |
+| `ATTACHMENT_MAX_BYTES` | `20971520`（20 MB） | 单件依据文件大小上限（字节）；超限返回 413 且不落盘 |
 
 > 安全提示：演示使用 HTTP 与种子密码。生产部署请置于 HTTPS 反向代理之后，并修改全部种子密码；
 > 种子账户仅在首次初始化（用户表为空）时生效。
@@ -140,11 +148,30 @@ npm test
    - 中途修订触及选区/插入点、目标段缺失、或预览之后版本/暂存区发生变化时，确认被拒绝并提示
      **重新预览**或在当前正文**手工选区提交**；原冲突提议、决议与历史版本均保持可追溯，
      新提议沿用现有复核与发布规则。
-6. **异议引用**：任何登录用户都可拖选原文范围提出异议，系统保存被引原文快照。
+   - **续提生成的新提议不自动继承旧附件**：旧附件随原冲突提议冻结保留，新提议需在其待复核期间另行上传。
+6. **依据附件（记录员上传，本轮新增）**：记录员可在**本人、且状态为“待复核(pending)”**的提议详情中
+   点击“上传依据文件”（或调用 HTTP API），为修订补充证据材料。
+   - 仅接收**内容可识别的 PDF、PNG、JPEG、MP3、WAV**（按文件头/魔术字节嗅探，改后缀名或伪造
+     `Content-Type` 无效），**单件不超过 20 MB**；提交时须给出**原始文件名**（仅作展示）与
+     **预期 SHA-256**（浏览器端自动计算）；服务端重新计算实际摘要，**摘要不符（422）、超限（413）、
+     类型不可识别/空文件/缺头（400）一律拒绝，不产生可见的半成品或孤儿记录**（先写临时文件再原子改名，
+     失败立即清理）。
+   - **删除误传附件**仅限提议仍待复核、且为上传者本人；删除同时移除元数据与磁盘文件。
+   - **冻结规则**：提议一经**采纳、驳回、标记冲突或发布**，附件集合立即冻结——只可查看/下载/在网页预览，
+     不能再增删；冻结判定在数据库事务内以**最终提议状态**复查（并发上传与复核以最终状态为准）。
+   - **保留与继承**：原文件随提议及历史决议永久保留，**重启后仍可查阅**（默认落在数据目录
+     `$DATA_DIR/attachments/`，随数据卷持久）；**续提生成的新提议不自动继承**旧附件。
+   - **权限**：复核员可查看/下载**全部**附件；记录员只能查看/下载**本人上传**（他人附件不可见、
+     下载/删除统一返回 404，不暴露存在性）；**参与者不得获得附件元数据、内容或下载地址**——
+     `GET /api/booth` 的提议与 `GET /api/versions/:id` 的决议中均不含附件字段，下载接口返回 404；
+     **保密段及历史视图也遵守同一权限**。网页对授权用户展示原名、类型、大小、上传者、时间与
+     预期/实际 SHA-256 校验信息，图片可预览、音频可在线播放、PDF 可新标签打开。
+7. **异议引用**：任何登录用户都可拖选原文范围提出异议，系统保存被引原文快照。
    - 之后发布的修订若与引用范围相交，引用不会自动改指新文字：该异议在新版本中显示
      **“待重新定位”**警示，原文快照继续保留；可由提出者或复核员在当前版本上手动重新定位并留痕。
-7. **版本查看**：“版本”面板可只读查看任一历史版本的**正文、决议（采纳/驳回/冲突/续提/发布留痕）、
-   异议与发布前异议回应**；历史版本内容不随后续发布改变。
+8. **版本查看**：“版本”面板可只读查看任一历史版本的**正文、决议（采纳/驳回/冲突/续提/发布留痕）、
+   异议与发布前异议回应**；历史版本内容不随后续发布改变。工作人员在相关决议中还能看到该提议
+   **已冻结的依据附件**（权限同上：记录员仅本人、复核员全部）。
    - **按段查看正文来源（本轮新增）**：在当前正文或任一历史版本视图中，每段段尾点击“来源”，
      即可查看该版该段每个**连续片段**的 **Unicode 码点半开区间 `[start,end)`、片段文字与来源**。
      来源只有两类：**初始导入**（`"source":"initial"`）或**最后写入该片段的已发布提议编号与发布版本**
@@ -156,7 +183,7 @@ npm test
    - 参与者对**当前保密段**在**所有版本**都看不到来源：接口返回 403，不获得片段文字、提议编号或来源；
      解除保密后按现有权限立即恢复。未导入（无文档）、未知版本或未知段号一律明确拒绝（409/404），
      不生成虚构来源。
-8. **段级保密（复核员，本轮新增）**：复核员在正文段尾点击“设为保密/解除保密”（或调用 HTTP API），
+9. **段级保密（复核员）**：复核员在正文段尾点击“设为保密/解除保密”（或调用 HTTP API），
    也可在工具栏“保密留痕”中查看全部变更。
    - **保密以段号为准**：段号在各版本间不变（发布只改段内正文），一次设置**立即作用于当前及全部历史版本**的
      参与者视图；**不改写**任何已发布版本、提议、异议、回应与决议原始记录——工作人员（记录员/复核员）始终看到全部内容。
@@ -205,6 +232,9 @@ HTTP 状态码与中文原因，且在数据库事务中执行——失败即回
 | `GET /api/secret-logs` | 复核员 | 保密变更留痕列表（段号、动作、前后状态、操作人、时间） |
 | `GET /api/versions/:id` | 登录用户 | 只读查看不可变版本（正文/决议/异议/发布前异议回应）；参与者视角下保密段仅返回占位且按段过滤决议、异议、回应与版本备注 |
 | `GET /api/versions/:id/sources/:seg` | 登录用户 | **按段查看版本 `:id` 第 `:seg` 段的正文连续片段来源**：返回该段正文与 `fragments`（每片含码点半开区间 `[start,end)`、`text` 与来源：`initial` 初始导入，或 `proposalId`+`versionId` 最后写入该片的已发布提议/发布版本）。来源沿逐次发布的修订几何重放，不按同文猜测；未导入 409、未知版本/段号 404；参与者查看当前保密段 403，解除保密后恢复 |
+| `POST /api/proposals/:id/attachments` | 记录员（本人） | **上传依据文件**：请求体为文件原始字节（非 JSON），请求头 `X-Attachment-Filename`（原始文件名，UTF-8 百分号编码，仅展示）、`X-Attachment-SHA256`（64 位十六进制预期摘要）。仅对本人**待复核**提议；内容须可识别为 PDF/PNG/JPEG/MP3/WAV 且 ≤ 20 MB，实际摘要须与预期一致。201 返回附件元数据；提议不存在 404、非本人/非记录员 403、已冻结 409、空文件/缺头/类型不可识别 400、摘要不符 422、超限 413；失败不留半成品或孤儿文件 |
+| `DELETE /api/attachments/:aid` | 记录员（上传者本人） | **删除误传附件**（事务内复查最终状态）：仅待复核提议可删；非本人统一 404（不暴露存在性），冻结后 409；元数据与磁盘文件一并移除 |
+| `GET /api/attachments/:aid/download` | 记录员（本人上传）/复核员 | **下载依据文件**：`Content-Type` 按内容嗅探结果、`X-Attachment-SHA256` 为实际摘要、`Content-Disposition` 含 RFC 5987 中文原始文件名。复核员可下载全部，记录员仅限本人上传；**参与者及未授权者一律 404**（不获得内容或地址），未登录 401 |
 
 ### 发布前异议回应调用示例（curl）
 
@@ -329,6 +359,66 @@ curl -s -b /tmp/par.cookie http://localhost:3000/api/versions/1/sources/7
 > 相邻边界、零长度纯插入与后续再次改写都能精确定位；服务端还会校验重放结果与该版不可变快照逐码点
 > 一致，不一致（数据损坏）时报错而非编造来源。
 
+### 依据附件调用示例（curl）
+
+```bash
+# 0) 记录员登录
+curl -i -c /tmp/rec.cookie -X POST http://localhost:3000/api/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"recorder","password":"recorder123"}'
+
+# 1) 计算文件的预期 SHA-256（小写十六进制），并对中文原始文件名做百分号编码
+SHA=$(sha256sum /tmp/现场录音.wav | awk '{print $1}')
+NAME=$(node -e "console.log(encodeURIComponent('现场录音 00-12.wav'))")
+
+# 2) 上传：请求体是文件原始字节（--data-binary），不要包成 JSON
+curl -s -b /tmp/rec.cookie -X POST http://localhost:3000/api/proposals/7/attachments \
+  -H 'Content-Type: application/octet-stream' \
+  -H "X-Attachment-Filename: ${NAME}" \
+  -H "X-Attachment-SHA256: ${SHA}" \
+  --data-binary @/tmp/现场录音.wav
+# 201 {
+#   "ok": true,
+#   "attachment": {
+#     "id": 3, "proposalId": 7, "displayName": "现场录音 00-12.wav",
+#     "mediaType": "wav", "mime": "audio/wav", "size": 182340,
+#     "expectedSha256": "9f1e…", "actualSha256": "9f1e…", "sha256Matched": true,
+#     "frozen": false,
+#     "uploadedBy": { "id": 1, "name": "记录员", "username": "recorder" },
+#     "uploadedAt": "2026-10-01 07:40:11",
+#     "url": "/api/attachments/3/download" } }
+
+# 3) 总览/历史视图中的附件元数据（工作人员；参与者的提议/决议中不含 attachments 字段）
+curl -s -b /tmp/rec.cookie http://localhost:3000/api/booth
+#   proposals[].attachments = [{ id, displayName, mediaType, size,
+#     expectedSha256, actualSha256, sha256Matched, frozen, uploadedBy, uploadedAt, url }]
+
+# 4) 下载（浏览器可直接打开该地址：图片内联、音频带播放器、PDF 新标签查看）
+curl -s -b /tmp/rec.cookie -D - -o /tmp/dl.wav http://localhost:3000/api/attachments/3/download
+#   HTTP/1.1 200
+#   Content-Type: audio/wav
+#   X-Attachment-SHA256: 9f1e…（实际摘要，可再次校验）
+#   Content-Disposition: inline; filename="…wav"; filename*=UTF-8''%E7%8E%B0%E5%9C%BA…
+sha256sum /tmp/dl.wav   # 与上面的 actualSha256 一致
+
+# 5) 待复核期间删除误传附件（仅上传者本人；事务内以最终提议状态为准）
+curl -s -b /tmp/rec.cookie -X DELETE http://localhost:3000/api/attachments/3
+# {"ok":true}
+
+# 6) 失败场景：均明确报错，且不留半成品/孤儿文件
+#   - 摘要不符：422 SHA256_MISMATCH（错误信息给出实际摘要）
+#   - 超过 20 MB：413 FILE_TOO_LARGE
+#   - 文本/GIF 等不支持内容（即使改名为 .pdf）：400 UNSUPPORTED_MEDIA_TYPE
+#   - 缺 X-Attachment-Filename / X-Attachment-SHA256、空文件、把请求体发成 JSON：400
+#   - 提议已采纳/驳回/冲突/发布：409 PROPOSAL_FROZEN
+#   - 为他人提议上传：403；删除/下载非本人附件（记录员视角）：404（不暴露存在性）
+#   - 参与者下载任意附件：404；未登录：401
+```
+
+> 网页操作：在右侧“提议”卡片点击打开提议详情，记录员在本人**待复核**提议的“依据附件”区选择文件即可
+> （浏览器自动计算 SHA-256）；音频可直接播放，图片可点“预览”，PDF/图片链接可新标签打开。
+> 附件冻结后上传与删除入口消失，仅保留下载与校验信息；历史版本只读视图的相关决议中同样列出冻结附件。
+
 ---
 
 ## 六、数据模型（SQLite）
@@ -350,6 +440,11 @@ curl -s -b /tmp/par.cookie http://localhost:3000/api/versions/1/sources/7
 - `secret_logs`：**保密/解除保密留痕**。记录段号、动作（`classify`/`declassify`）、操作人、
   时间与前后状态（`previous_state`/`new_state`），不可变追加。保密不更新任何版本与业务记录表，
   对参与者的屏蔽只在视图层按 `segment_secrets` 过滤。
+- `proposal_attachments`：**提议依据附件**。保存所属提议、**仅作展示的原始文件名**（`display_name`）、
+  随机落盘相对名（`stored_name`，唯一，绝不使用客户端原名拼路径）、按内容嗅探的 `media_type`/`mime_type`、
+  字节数、**预期摘要 `expected_sha256` 与实算摘要 `actual_sha256`**（两者相等才允许落库）、上传者与时间。
+  附件冻结与否不额外建列——由所属 `proposals.status` 实时决定（仅 `pending` 可增删）；
+  删除是硬删除（同时移除磁盘文件），保留的附件随提议与历史决议永久留存；续提只新建提议，不复制附件行。
 
 ---
 
@@ -363,16 +458,19 @@ curl -s -b /tmp/par.cookie http://localhost:3000/api/versions/1/sources/7
 ├── package.json
 ├── sample-transcript.txt    # 示例逐字稿
 ├── src
-│   ├── server.js            # Express 路由与错误出口
+│   ├── server.js            # Express 路由与错误出口（含附件原始字节上传/下载）
 │   ├── auth.js              # Cookie 会话与角色鉴权
 │   ├── db.js                # SQLite 连接、建表、种子账户
-│   ├── store.js             # 业务核心：导入/提议/复核/发布/续提/异议/版本视图/正文来源
+│   ├── store.js             # 业务核心：导入/提议/复核/发布/续提/异议/版本视图/正文来源/附件权限
+│   ├── attachments.js       # 依据附件：内容类型嗅探、SHA-256、临时文件原子落盘
 │   └── text.js              # 码点偏移、范围校验、合版、引用映射、续提换算、来源重放
 ├── public                   # 浏览器前端（原生 HTML/CSS/JS，无构建步骤）
 │   ├── index.html
 │   ├── styles.css
 │   └── app.js
 └── test
-    ├── unit.test.js         # 文本算子与解析的单元测试
-    └── e2e.test.js          # 临时库 + 真实 HTTP 的端到端测试
+    ├── unit.test.js         # 文本算子、解析与附件类型嗅探的单元测试
+    ├── e2e.test.js          # 临时库 + 真实 HTTP 的端到端测试
+    ├── attachments.test.js  # 附件：校验/权限/冻结/删除/续提不继承/并发/无孤儿
+    └── attachments-restart.test.js # 附件：同一数据目录重启后的持久化与权限回归
 ```

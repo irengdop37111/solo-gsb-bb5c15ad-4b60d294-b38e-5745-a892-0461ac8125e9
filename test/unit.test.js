@@ -1,8 +1,10 @@
 'use strict';
 // 纯文本算子单元测试（码点偏移、合版、引用映射、续提换算）
 const assert = require('assert');
+const crypto = require('crypto');
 const { codeLength, sliceCP, validateRange, applyEdits, transformRange, transformRangeRebase, editTouchesAnchor, replayProvenance } = require('../src/text');
 const { parseTranscript } = require('../src/store');
+const { sniffMediaType, sha256, MEDIA_TYPES, formatBytes } = require('../src/attachments');
 
 let n = 0;
 const ok = (c, m) => { assert(c, m); n++; console.log('  ✓', m); };
@@ -168,5 +170,48 @@ tk = replayProvenance('甲乙', [
 ]);
 ok(tk.map((t) => t.ch).join('') === '甲RL乙' && tk[1].tag.proposalId === 2 && tk[2].tag.proposalId === 1,
   '来源重放：同点零长度插入按合版实际顺序归属（后应用的 #2 文本在左、#1 在右）');
+
+// ---------- 附件内容嗅探：只认文件内容，不认后缀/客户端声明类型 ----------
+const png1x1 = Buffer.from(
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M8AAAMBAQDJ/pLvAAAAAElFTkSuQmCC',
+  'base64'
+);
+ok(sniffMediaType(png1x1) === MEDIA_TYPES.png, '按 PNG 签名识别图片');
+
+const jpegMin = Buffer.concat([
+  Buffer.from([0xff, 0xd8, 0xff, 0xe0]),
+  Buffer.from('JFIF', 'latin1'),
+  Buffer.from([0, 0, 0]),
+  Buffer.from([0xff, 0xd9]),
+]);
+ok(sniffMediaType(jpegMin) === MEDIA_TYPES.jpeg, '按 JPEG SOI/EOI 识别图片（中间内容不检查）');
+
+const wavMin = Buffer.concat([
+  Buffer.from('RIFF', 'latin1'),
+  Buffer.from([0x24, 0, 0, 0]),
+  Buffer.from('WAVE', 'latin1'),
+  Buffer.from('fmt ', 'latin1'),
+]);
+ok(sniffMediaType(wavMin) === MEDIA_TYPES.wav, '按 RIFF....WAVE 识别 WAV');
+
+const mp3Id3 = Buffer.concat([Buffer.from('ID3', 'latin1'), Buffer.from([0x03, 0, 0, 0, 0, 0, 0])]);
+ok(sniffMediaType(mp3Id3) === MEDIA_TYPES.mp3, '带 ID3v2 标签的 MP3 可识别');
+ok(sniffMediaType(Buffer.from([0xff, 0xfb, 0x90])) === MEDIA_TYPES.mp3, '按 MPEG 帧同步字识别裸 MP3');
+ok(sniffMediaType(Buffer.from([0xff, 0xf3, 0x90])) === MEDIA_TYPES.mp3, '0xFFF3 同步字识别 MP3');
+ok(sniffMediaType(Buffer.from('%PDF-1.7\nhello')) === MEDIA_TYPES.pdf, '按 %PDF- 识别 PDF');
+
+ok(sniffMediaType(Buffer.from('')) === null, '空文件拒绝');
+ok(sniffMediaType(Buffer.from('abc')) === null, '过短内容拒绝');
+ok(sniffMediaType(Buffer.from('GIF89a...')) === null, 'GIF 不在允许类型内，拒绝');
+ok(sniffMediaType(Buffer.from('this is plain text'.repeat(4))) === null, '纯文本即使改名 .pdf 也拒绝');
+ok(sniffMediaType(Buffer.concat([Buffer.from('%PDF-1.4'), Buffer.from([0xff, 0xd8, 0xff, 0xd9])])) === MEDIA_TYPES.pdf,
+  '文件头优先（PDF 头 + 伪 JPEG 尾识别为 PDF）');
+ok(sniffMediaType(Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe1]), Buffer.from('Exif'.padEnd(20, 'x')), Buffer.from([0xff, 0xd9])])) === MEDIA_TYPES.jpeg,
+  'Exif JPEG（APP1）仍按 SOI/EOI 识别');
+
+// SHA-256 与大小格式化
+const known = crypto.createHash('sha-256').update('abc').digest('hex');
+ok(sha256(Buffer.from('abc')) === known, 'SHA-256 计算与标准向量一致');
+ok(formatBytes(500) === '500 B' && /KB/.test(formatBytes(2048)) && /MB/.test(formatBytes(5 * 1024 * 1024)), '文件大小可读格式化');
 
 console.log(`\n单元测试全部通过：${n} 项 ✅`);
