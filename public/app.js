@@ -41,6 +41,117 @@ function toast(msg, kind = '') {
   t.classList.remove('hidden');
 }
 
+// ---------- 依据文件（附件） ----------
+const ATTACHMENT_MAX_BYTES = 20 * 1024 * 1024; // 单件 20 MB（与后端默认一致）
+const ATTACH_ACCEPT = '.pdf,.png,.jpg,.jpeg,.mp3,.wav,application/pdf,image/png,image/jpeg,audio/mpeg,audio/wav,audio/x-wav';
+const ATTACH_KIND_LABEL = { PDF: 'PDF', PNG: 'PNG 图片', JPEG: 'JPEG 图片', MP3: 'MP3 音频', WAV: 'WAV 音频' };
+const ATTACH_KIND_ICON = { PDF: '📄', PNG: '🖼', JPEG: '🖼', MP3: '🎵', WAV: '🎵' };
+
+function formatBytes(n) {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / 1024 / 1024).toFixed(2)} MB`;
+}
+
+// 上传依据文件：原始字节直传，原名经 X-Filename（仅展示），预期摘要经 X-Sha256
+async function uploadAttachment(proposalId, file) {
+  const buf = await file.arrayBuffer();
+  const sha = await window.sha256Hex(buf);
+  const res = await fetch(`/api/proposals/${proposalId}/attachments`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/octet-stream',
+      'X-Filename': file.name,
+      'X-Sha256': sha,
+    },
+    body: buf,
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const err = new Error(data.error || `上传失败（${res.status}）`);
+    err.status = res.status;
+    throw err;
+  }
+  return data;
+}
+
+async function deleteAttachment(proposalId, attachmentId) {
+  return api(`/api/proposals/${proposalId}/attachments/${attachmentId}`, { method: 'DELETE' });
+}
+
+// 下载/预览：经 blob 在浏览器中打开，使 403/404 能以中文错误提示而不是跳转报错
+async function openAttachment(a) {
+  let res;
+  try {
+    res = await fetch(`/api/attachments/${a.id}`);
+  } catch (_) {
+    return toast('下载失败：网络错误', 'error');
+  }
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    return toast(data.error || `下载失败（${res.status}）`, 'error');
+  }
+  const blob = await res.blob();
+  const url = URL.createObjectURL(blob);
+  const win = window.open(url, '_blank');
+  if (!win) {
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = a.filename;
+    link.click();
+  }
+  setTimeout(() => URL.revokeObjectURL(url), 60000);
+}
+
+// 依据文件列表渲染（meta 中含校验信息：实际大小与实际 SHA-256）
+function attachmentListHtml(list, { canManage = false } = {}) {
+  if (!list || !list.length) return '';
+  return `<div class="attach-list">${list.map((a) => `
+    <div class="attach-item">
+      <span class="attach-icon">${ATTACH_KIND_ICON[a.mediaKind] || '📎'}</span>
+      <div class="attach-main">
+        <div class="attach-name" title="${esc(a.filename)}">${esc(a.filename)}</div>
+        <div class="attach-meta">
+          ${ATTACH_KIND_LABEL[a.mediaKind] || a.mediaKind} · ${formatBytes(a.size)}
+          · ${esc(a.uploadedBy.displayName)}（${esc(a.uploadedBy.username)}）· ${a.uploadedAt} UTC
+        </div>
+        <div class="attach-meta attach-verify">✔ SHA-256：${esc(a.sha256)}</div>
+      </div>
+      <div class="attach-actions">
+        <button class="btn small" data-att-open="${a.id}">查看/下载</button>
+        ${canManage ? `<button class="btn small danger" data-att-del="${a.id}">删除误传</button>` : ''}
+      </div>
+    </div>`).join('')}</div>`;
+}
+
+function bindAttachmentButtons(root, proposalId, { canManage = false, onChange = () => {} } = {}) {
+  $$(root + ' [data-att-open]').forEach((b) => {
+    b.addEventListener('click', async () => {
+      const meta = findAttachmentMeta(proposalId, parseInt(b.dataset.attOpen, 10));
+      if (meta) await openAttachment(meta);
+    });
+  });
+  $$(root + ' [data-att-del]').forEach((b) => {
+    b.addEventListener('click', async () => {
+      const aid = parseInt(b.dataset.attDel, 10);
+      const meta = findAttachmentMeta(proposalId, aid);
+      if (!window.confirm(`确认删除误传的依据文件“${meta ? meta.filename : aid}”？\n仅在提议待复核期间允许删除；采纳/驳回/冲突/发布后集合冻结。`)) return;
+      try {
+        await deleteAttachment(proposalId, aid);
+        toast(`依据文件 #${aid} 已删除`, 'success');
+        await onChange();
+      } catch (err) { toast(err.message, 'error'); }
+    });
+  });
+}
+
+// 在总览的提议列表中查找附件元数据（历史版本弹窗使用自身传入的集合）
+function findAttachmentMeta(proposalId, attachmentId, listOverride) {
+  const list = listOverride
+    || ((booth.proposals.find((p) => p.id === proposalId) || {}).attachments || []);
+  return list.find((a) => a.id === attachmentId) || null;
+}
+
 // ---------- 弹窗 ----------
 function openModal(html, wide = false) {
   const box = wide ? $('#version-box') : $('#modal-box');
@@ -509,6 +620,25 @@ function openProposalModal(id) {
   const canReview = me.role === 'reviewer';
   const actionable = canReview && p.base_ver === cur && (p.status === 'pending' || p.status === 'adopted');
   const same = p.replacement === p.original_excerpt;
+  // 依据文件：本人待复核提议可上传/删除误传；复核员可查看全部；参与者无此区块
+  const isOwner = p.creator_user === me.username;
+  const canManageAtt = me.role === 'recordist' && isOwner && p.status === 'pending';
+  const canViewAtt = !!((p.attachments || []).length) &&
+    (me.role === 'reviewer' || (me.role === 'recordist' && isOwner));
+  const attachHtml = canViewAtt || canManageAtt ? `
+    <div class="basis" style="margin-top:10px">
+      <b>依据文件（${(p.attachments || []).length}）：</b>
+      ${p.status === 'pending'
+        ? '<span class="attach-frozen">待复核期间可上传或删除误传附件；文件名仅作展示，以服务端记录的大小与 SHA-256 为准。</span>'
+        : '<span class="attach-frozen">提议已处理，附件集合已冻结并随历史决议保留；续提的新提议不继承这些附件。</span>'}
+      ${attachmentListHtml(p.attachments, { canManage: canManageAtt })}
+      ${canManageAtt ? `
+        <label class="upload-drop" id="att-drop">
+          ⬆ 上传依据文件（PDF / PNG / JPEG / MP3 / WAV，单件 ≤ 20 MB）
+          <input type="file" id="att-file" accept="${ATTACH_ACCEPT}" hidden />
+        </label>
+        <div class="card-meta" id="att-msg"></div>` : ''}
+    </div>` : '';
   openModal(`
     <h3>提议 #${p.id} <span class="tag tag-${p.status}">${STATUS_LABEL[p.status]}</span></h3>
     <div class="card-meta">
@@ -521,6 +651,7 @@ function openProposalModal(id) {
     <div class="quote">${esc(p.original_excerpt)}</div>
     <div><span class="arrow">替换为 →</span><span class="replacement">${esc(p.replacement) || '（空串·删除）'}</span>${same ? ' <span class="muted">（与原文相同）</span>' : ''}</div>
     <div class="basis" style="margin-top:8px"><b>依据：</b>${esc(p.basis)}</div>
+    ${attachHtml}
     ${p.conflict_reason ? `<div class="conflict-reason">冲突原因：${esc(p.conflict_reason)}</div>` : ''}
     <div class="actions">
       <button class="btn" data-close>关闭</button>
@@ -528,6 +659,8 @@ function openProposalModal(id) {
       ${actionable && p.status === 'adopted' ? '<button class="btn danger" id="p-reject">驳回（移出暂存区）</button>' : ''}
       ${canRebase(p) ? '<button class="btn primary" id="p-rebase">续提到当前版本…</button>' : ''}
     </div>`);
+
+  bindProposalAttachments(p, canManageAtt);
 
   const rebaseBtn = $('#p-rebase');
   if (rebaseBtn) rebaseBtn.addEventListener('click', () => openRebase(p.id));
@@ -555,6 +688,40 @@ function openProposalModal(id) {
       await reload();
       toast(`提议 #${id} 已驳回`, 'success');
     } catch (err) { toast(err.message, 'error'); await reload(); }
+  });
+}
+
+// ---------- 提议弹窗中的依据文件上传/删除/下载 ----------
+function bindProposalAttachments(p, canManage) {
+  bindAttachmentButtons('#modal-box', p.id, {
+    canManage,
+    onChange: async () => { await reload(); openProposalModal(p.id); },
+  });
+  const input = $('#att-file');
+  if (!input) return;
+  input.addEventListener('change', async () => {
+    const file = input.files[0];
+    if (!file) return;
+    const msg = $('#att-msg');
+    if (file.size > ATTACHMENT_MAX_BYTES) {
+      msg.textContent = `文件 ${formatBytes(file.size)} 超过单件 20 MB 上限，未上传`;
+      msg.style.color = 'var(--danger)';
+      input.value = '';
+      return;
+    }
+    msg.textContent = `正在计算 SHA-256 并上传“${file.name}”（${formatBytes(file.size)}）……`;
+    msg.style.color = '';
+    try {
+      const r = await uploadAttachment(p.id, file);
+      toast(`依据文件 #${r.id} 已上传：SHA-256 校验一致`, 'success');
+      closeModal();
+      await reload();
+      openProposalModal(p.id);
+    } catch (err) {
+      msg.textContent = err.message;
+      msg.style.color = 'var(--danger)';
+      input.value = '';
+    }
   });
 }
 
@@ -747,6 +914,11 @@ function renderProposals() {
       <div class="quote">${esc(p.original_excerpt)}</div>
       <div><span class="arrow">→</span><span class="replacement">${esc(p.replacement) || '（删除）'}</span></div>
       <div class="basis"><b>依据：</b>${esc(p.basis)}</div>
+      ${(p.attachments || []).length ? `
+      <div class="card-meta" style="margin-top:4px">
+        📎 依据文件 ${p.attachments.length} 个：
+        ${p.attachments.map((a) => `<button class="btn tiny" data-att-open2="${p.id}:${a.id}" title="${esc(a.filename)} · ${formatBytes(a.size)} · SHA-256 ${esc(a.sha256)}">${ATTACH_KIND_ICON[a.mediaKind] || '📎'} ${esc(a.filename)}</button>`).join(' ')}
+      </div>` : ''}
       ${p.conflict_reason ? `<div class="conflict-reason">${esc(p.conflict_reason)}</div>` : ''}
       ${canReview ? `
       <div class="card-actions">
@@ -763,6 +935,14 @@ function renderProposals() {
 
   $$('#panel-proposals [data-rebase]').forEach((b) =>
     b.addEventListener('click', () => openRebase(parseInt(b.dataset.rebase, 10))));
+
+  $$('#panel-proposals [data-att-open2]').forEach((b) =>
+    b.addEventListener('click', async () => {
+      const [pid, aid] = b.dataset.attOpen2.split(':').map((x) => parseInt(x, 10));
+      const meta = findAttachmentMeta(pid, aid);
+      if (meta) await openAttachment(meta);
+      else toast('无权获取该依据文件或文件不存在', 'error');
+    }));
 
   $$('#panel-proposals [data-adopt]').forEach((b) => b.addEventListener('click', async () => {
     const id = parseInt(b.dataset.adopt, 10);
@@ -904,9 +1084,32 @@ function showVersionModal(v) {
             <div class="basis">${esc(r.note)}</div>
             <div class="card-meta">${esc(r.responder_name)}（${esc(r.responder_user)}）· 回应于 v${r.version_id} · ${r.created_at} UTC · 随 v${r.published_version_id} 发布（只读归档）</div>
           </div>`).join('') : '<p class="muted">本版本无发布前异议回应（发布未触及异议，或按原规则发布）。</p>'}
-      </div>`, true);
+      </div>
+      ${me.role !== 'participant' ? `
+      <div class="v-section">
+        <h4>依据文件（${(v.attachments || []).length}）</h4>
+        ${(v.attachments || []).length ? (() => {
+          const byP = new Map();
+          for (const a of v.attachments || []) {
+            if (!byP.has(a.proposalId)) byP.set(a.proposalId, []);
+            byP.get(a.proposalId).push(a);
+          }
+          return [...byP.entries()].map(([pid, list]) => `
+            <div class="decision-item t-adopt">
+              <b>提议 #${pid} 的依据文件（${list.length}）</b>
+              ${attachmentListHtml(list, { canManage: false })}
+            </div>`).join('');
+        })() : '<p class="muted">本版本决议涉及的提议没有依据文件。</p>'}
+        <p class="muted">原文件随提议及历史决议只读保留（含大小与实际 SHA-256 校验信息）；复核员可查看全部，记录员仅可查看本人附件。</p>
+      </div>` : ''}`, true);
   $$('#version-box [data-src-ver]').forEach((b) =>
     b.addEventListener('click', () => openProvenance(parseInt(b.dataset.srcVer, 10), parseInt(b.dataset.srcSeg, 10), v)));
+  $$('#version-box [data-att-open]').forEach((b) =>
+    b.addEventListener('click', () => {
+      const aid = parseInt(b.dataset.attOpen, 10);
+      const meta = (v.attachments || []).find((x) => x.id === aid);
+      if (meta) openAttachment(meta);
+    }));
 }
 
 // ---------- 正文来源（按段、按已发布版本，逐次发布修订重放） ----------

@@ -4,6 +4,7 @@ const express = require('express');
 const { openDb, verifyPassword } = require('./db');
 const { currentUser, requireAuth, requireRole, createSession, destroySession } = require('./auth');
 const store = require('./store');
+const { MAX_ATTACHMENT_BYTES } = require('./attachments');
 
 const PORT = parseInt(process.env.PORT || '3000', 10);
 const HOST = process.env.HOST || '0.0.0.0';
@@ -154,11 +155,102 @@ app.get('/api/versions/:id/sources/:seg', requireAuth, wrap((req, res) => {
   ));
 }));
 
+// ---------- 提议依据文件（附件） ----------
+// 上传：请求体为原始文件字节（application/octet-stream）；
+// 原名经 X-Filename（仅展示）、预期 SHA-256 经 X-Sha256 提交。
+// 仅记录员可上传到本人 pending 提议；类型/大小/摘要/状态任一不符均明确报错且不写入。
+function decodeHeader(req, name) {
+  const v = req.headers[name];
+  if (typeof v !== 'string') return undefined;
+  try {
+    return Buffer.from(v, 'latin1').toString('utf8');
+  } catch (_) {
+    return v;
+  }
+}
+
+app.post(
+  '/api/proposals/:id/attachments',
+  requireRole('recordist'),
+  (req, res, next) => {
+    const declared = parseInt(req.headers['content-length'], 10);
+    if (Number.isFinite(declared) && declared > MAX_ATTACHMENT_BYTES) {
+      return res.status(413).json({
+        error: `依据文件超过大小上限：声明大小 ${declared} 字节，单件不得超过 ${MAX_ATTACHMENT_BYTES} 字节（20 MB）`,
+        code: 'FILE_TOO_LARGE',
+      });
+    }
+    express.raw({ type: () => true, limit: MAX_ATTACHMENT_BYTES })(req, res, (err) => {
+      if (err) {
+        if (err.type === 'entity.too.large' || /request entity too large/i.test(err.message)) {
+          return res.status(413).json({
+            error: `依据文件超过大小上限：单件不得超过 ${MAX_ATTACHMENT_BYTES} 字节（20 MB），已拒绝且未保存`,
+            code: 'FILE_TOO_LARGE',
+          });
+        }
+        return res.status(400).json({ error: `依据文件解析失败：${err.message}`, code: 'BAD_REQUEST' });
+      }
+      next();
+    });
+  },
+  wrap((req, res) => {
+    const proposalId = parseInt(req.params.id, 10);
+    const result = store.addProposalAttachment(db, req.user, proposalId, {
+      content: req.body,
+      filename: decodeHeader(req, 'x-filename'),
+      expectedSha: req.headers['x-sha256'],
+      declaredLength: parseInt(req.headers['content-length'], 10),
+    });
+    res.status(201).json({
+      ok: true,
+      id: result.id,
+      proposalId,
+      filename: result.filename,
+      size: result.size,
+      sha256: result.sha256,
+      mediaKind: result.kind,
+      mediaType: result.mediaType,
+    });
+  })
+);
+
+// 删除误传附件：仅上传者本人，且提议仍待复核（pending）
+app.delete('/api/proposals/:id/attachments/:aid', requireRole('recordist'), wrap((req, res) => {
+  store.deleteProposalAttachment(db, req.user, parseInt(req.params.id, 10), parseInt(req.params.aid, 10));
+  res.json({ ok: true });
+}));
+
+// 下载/预览依据文件：复核员可取全部，记录员仅取本人，参与者一律 403（也不获得下载地址）
+app.get('/api/attachments/:aid', requireAuth, wrap((req, res) => {
+  const found = store.getAttachmentContent(db, req.user, parseInt(req.params.aid, 10));
+  if (!found) return res.status(404).json({ error: '依据文件不存在', code: 'NOT_FOUND' });
+  const { meta, content } = found;
+  const asciiName = meta.filename.replace(/[^\x20-\x7e]/g, '_').replace(/["\\]/g, '_');
+  res.setHeader('Content-Type', meta.mediaType);
+  res.setHeader('Content-Length', content.length);
+  res.setHeader(
+    'Content-Disposition',
+    `inline; filename="${asciiName}"; filename*=UTF-8''${encodeURIComponent(meta.filename)}`
+  );
+  // 校验信息经自定义响应头一并给出（网页也会在元数据中展示）
+  res.setHeader('X-Attachment-Id', String(meta.id));
+  res.setHeader('X-Attachment-Sha256', meta.sha256);
+  res.setHeader('X-Attachment-Size', String(meta.size));
+  res.send(content);
+}));
+
 // ---------- 静态前端 ----------
 app.use(express.static(path.join(__dirname, '..', 'public')));
 
 // ---------- 错误处理 ----------
 app.use((err, _req, res, _next) => {
+  // body-parser（json/raw）错误：请求体过大或内容无法解析——明确报错，不产生任何记录
+  if (err && (err.type === 'entity.too.large' || /request entity too large/i.test(err.message || ''))) {
+    return res.status(413).json({ error: `请求体超过大小上限，已拒绝（${err.message}）`, code: 'PAYLOAD_TOO_LARGE' });
+  }
+  if (err && (err.type === 'entity.parse.failed' || err.type === 'encoding.unsupported' || /^Unexpected token/.test(err.message || ''))) {
+    return res.status(400).json({ error: `请求体无法解析：${err.message}`, code: 'BAD_REQUEST' });
+  }
   const status = err.status || 500;
   if (status >= 500) console.error('[error]', err);
   res.status(status).json({

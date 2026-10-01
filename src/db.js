@@ -170,6 +170,24 @@ function initSchema(db) {
     created_at  TEXT NOT NULL DEFAULT (datetime('now'))
   );
   CREATE INDEX IF NOT EXISTS idx_secret_logs_seg ON secret_logs(seg, id);
+
+  -- 修订提议依据文件：文件内容为 BLOB（与元数据同库同事务，失败不产生孤儿记录）。
+  -- 文件名只作展示；实际以后端记录的大小与 SHA-256 为准。提议离开 pending
+  -- （采纳/驳回/标记冲突/发布）后集合冻结：行永不更新、永不删除，随提议与历史决议保留。
+  CREATE TABLE IF NOT EXISTS proposal_attachments (
+    id          INTEGER PRIMARY KEY,
+    proposal_id INTEGER NOT NULL REFERENCES proposals(id),
+    filename    TEXT NOT NULL,        -- 提交原名（仅展示用）
+    media_type  TEXT NOT NULL,        -- 内容识别出的媒体类型（如 application/pdf）
+    media_kind  TEXT NOT NULL,        -- PDF | PNG | JPEG | MP3 | WAV
+    size_bytes  INTEGER NOT NULL,     -- 实际字节数
+    sha256      TEXT NOT NULL,        -- 服务端实算的实际 SHA-256（十六进制）
+    content     BLOB NOT NULL,        -- 文件原始内容
+    uploaded_by INTEGER NOT NULL REFERENCES users(id),
+    created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+  CREATE INDEX IF NOT EXISTS idx_attachments_proposal ON proposal_attachments(proposal_id, id);
+  CREATE INDEX IF NOT EXISTS idx_attachments_uploader ON proposal_attachments(uploaded_by);
   `);
 
   // 既有数据库的轻量迁移：补充续提所需列，并按冲突原因文本回填类别

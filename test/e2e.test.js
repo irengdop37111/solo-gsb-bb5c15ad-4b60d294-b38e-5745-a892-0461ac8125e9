@@ -3,8 +3,11 @@
 process.env.DATA_DIR = '/tmp/hrc-test-data';
 process.env.PORT = '3987';
 process.env.HOST = '127.0.0.1';
+// 依据文件大小上限在测试中调小为 64 KB，便于构造“超限”用例（默认生产为 20 MB）
+process.env.ATTACHMENT_MAX_BYTES = String(64 * 1024);
 
 const fs = require('fs');
+const crypto = require('crypto');
 fs.rmSync(process.env.DATA_DIR, { recursive: true, force: true });
 
 const assert = require('assert');
@@ -23,6 +26,34 @@ async function req(method, path, body, cookie) {
   });
   const json = await res.json().catch(() => ({}));
   return { status: res.status, json, setCookie: res.headers.get('set-cookie') || '' };
+}
+
+// 上传依据文件（原始字节 + 原名 + 预期 SHA-256）；返回 {status,json}
+// HTTP 头为 latin1：中文名按 UTF-8 字节编码到 latin1（与浏览器 XMLHttpRequest 的做法一致），
+// 服务端以 latin1 读头后按 UTF-8 解码。
+async function upload(pid, buf, filename, cookie, expectedSha = crypto.createHash('sha256').update(buf).digest('hex')) {
+  const filenameHeader = Buffer.from(filename, 'utf8').toString('latin1');
+  const res = await fetch(`${BASE}/api/proposals/${pid}/attachments`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/octet-stream',
+      'X-Filename': filenameHeader,
+      'X-Sha256': expectedSha,
+      ...(cookie ? { Cookie: cookie } : {}),
+    },
+    body: buf,
+  });
+  const json = await res.json().catch(() => ({}));
+  return { status: res.status, json };
+}
+
+// 下载依据文件：返回 {status, bytes, headers}
+async function download(aid, cookie) {
+  const res = await fetch(`${BASE}/api/attachments/${aid}`, {
+    headers: cookie ? { Cookie: cookie } : {},
+  });
+  const ab = await res.arrayBuffer().catch(() => null);
+  return { status: res.status, bytes: ab && Buffer.from(ab), headers: res.headers };
 }
 async function expectFail(p, statusPart, msgPart, label) {
   const r = await p;
@@ -933,6 +964,248 @@ async function main() {
   assertFragmentsCover(srcBack, `解除后参与者查看 v${verC} 第3段`);
   ok(srcBack.fragments.some((f) => f.source === 'proposal'),
     '解除保密后参与者重新获得该段来源（含历史修订产生的提议来源）');
+
+  console.log('\n[依据文件：上传权限、类型/摘要/大小校验与记录]');
+  booth = (await req('GET', '/api/booth', null, rec)).json;
+  const attSeg = booth.segments[0];
+  const attP = await req('POST', '/api/proposals',
+    { seg: attSeg.seg, start: 0, end: 1, replacement: attSeg.text[0], basis: '依据文件流程测试' }, rec);
+  assert.strictEqual(attP.status, 201);
+  const attPid = attP.json.id;
+
+  const PNG = Buffer.from(
+    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==',
+    'base64'
+  );
+  const PNG_SHA = crypto.createHash('sha256').update(PNG).digest('hex');
+  const JPEG = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0x00, 0xff, 0xd9]);
+  const WAV = Buffer.concat([Buffer.from('RIFF'), Buffer.alloc(4), Buffer.from('WAVEfmt '), Buffer.alloc(24)]);
+  const MP3 = Buffer.concat([Buffer.from('ID3'), Buffer.from([3, 0, 0]), Buffer.alloc(20, 0)]);
+  const PDF = Buffer.from('%PDF-1.7\n%\xe2\xe3\xcf\xd3\nminimal-pdf-body');
+
+  // 未登录 / 复核员 / 参与者上传均被拒绝
+  const upAnon = await upload(attPid, PNG, 'a.png', null);
+  ok(upAnon.status === 401, '未登录上传依据文件被拒绝');
+  await expectFail(upload(attPid, PNG, 'a.png', rev).then((r) => ({ status: r.status, json: r.json })),
+    403, '无权操作', '复核员尝试上传依据文件');
+  await expectFail(upload(attPid, PNG, 'a.png', par).then((r) => ({ status: r.status, json: r.json })),
+    403, '无权操作', '参与者尝试上传依据文件');
+
+  // 记录员上传到他人提议（attPid 属于 rec；rec2 是另一名记录员）→ 403
+  await expectFail(upload(attPid, PNG, 'a.png', rec2).then((r) => ({ status: r.status, json: r.json })),
+    403, '本人', '非提议提交人记录员尝试上传');
+
+  // 正常上传 PNG：记录上传者、时间、大小与实际 SHA-256；原名只作展示
+  const up1 = await upload(attPid, PNG, '证据 01.png', rec);
+  assert.strictEqual(up1.status, 201, `PNG 上传应成功，实际 ${JSON.stringify(up1.json)}`);
+  const aid1 = up1.json.id;
+  ok(up1.json.size === PNG.length && up1.json.sha256 === PNG_SHA && up1.json.mediaKind === 'PNG',
+    '上传成功返回实际大小、实际 SHA-256 与识别类型');
+  booth = (await req('GET', '/api/booth', null, rec)).json;
+  const attProp = booth.proposals.find((x) => x.id === attPid);
+  ok(Array.isArray(attProp.attachments) && attProp.attachments.length === 1, '总览中提议带 1 个附件元数据');
+  const am1 = attProp.attachments[0];
+  ok(am1.filename === '证据 01.png' && am1.size === PNG.length && am1.sha256 === PNG_SHA &&
+     am1.uploadedBy.username === 'recorder' && am1.uploadedAt,
+    '文件名只作展示；元数据记录上传者、时间、大小与实际 SHA-256');
+
+  // 同一提议可再传 PDF/JPEG/MP3/WAV（全部允许类型）
+  for (const [buf, name, kind] of [[PDF, '材料.pdf', 'PDF'], [JPEG, '照片.jpg', 'JPEG'],
+                                  [MP3, '录音.mp3', 'MP3'], [WAV, '录音.wav', 'WAV']]) {
+    const r = await upload(attPid, buf, name, rec);
+    assert.strictEqual(r.status, 201, `${kind} 上传应成功：${JSON.stringify(r.json)}`);
+    ok(r.json.mediaKind === kind, `${name} 内容识别为 ${kind}`);
+  }
+
+  // 失败场景：类型不可识别、摘要不符、超限、空文件、缺头
+  await expectFail(upload(attPid, Buffer.from('GIF89a not gif body'), 'x.gif', rec)
+    .then((r) => ({ status: r.status, json: r.json })), 422, '无法识别', 'GIF 等非允许类型被拒绝');
+  await expectFail(upload(attPid, Buffer.from('not an image at all'), 'x.png', rec)
+    .then((r) => ({ status: r.status, json: r.json })), 422, '无法识别', '扩展名伪装但内容无法识别被拒绝');
+  await expectFail(upload(attPid, PNG, 'a.png', rec, '0'.repeat(64))
+    .then((r) => ({ status: r.status, json: r.json })), 422, 'SHA-256 摘要不符', '预期摘要不符被拒绝');
+  await expectFail(upload(attPid, Buffer.alloc(64 * 1024 + 1, 0x50), 'big.pdf', rec)
+    .then((r) => ({ status: r.status, json: r.json })), 413, '上限', '超过 20MB（测试阈值 64KB）被拒绝');
+  await expectFail(upload(attPid, Buffer.alloc(0), 'empty.png', rec)
+    .then((r) => ({ status: r.status, json: r.json })), 400, '内容为空', '空文件被拒绝');
+  await expectFail(upload(99999, PNG, 'a.png', rec)
+    .then((r) => ({ status: r.status, json: r.json })), 404, '不存在', '向不存在的提议上传被拒绝');
+
+  // 校验失败不得产生半成品/孤儿：附件仍只有 5 个
+  booth = (await req('GET', '/api/booth', null, rec)).json;
+  ok(booth.proposals.find((x) => x.id === attPid).attachments.length === 5,
+    '类型/摘要/超限/空文件等失败均未产生附件记录（无半成品/孤儿）');
+
+  console.log('\n[依据文件：查看与下载权限（复核员全部、记录员本人、参与者禁止）]');
+  const dl1 = await download(aid1, rec);
+  assert.strictEqual(dl1.status, 200);
+  ok(dl1.bytes.equals(PNG), '本人记录员可下载附件，内容逐字节一致');
+  ok(dl1.headers.get('content-type') === 'image/png' &&
+     dl1.headers.get('x-attachment-sha256') === PNG_SHA &&
+     dl1.headers.get('x-attachment-size') === String(PNG.length),
+    '下载响应给出内容类型与校验信息（SHA-256/大小）');
+
+  const dlRev = await download(aid1, rev);
+  ok(dlRev.status === 200 && dlRev.bytes.equals(PNG), '复核员可下载任意记录员的附件');
+  // 另一名记录员看不到他人附件元数据，也不能下载
+  booth = (await req('GET', '/api/booth', null, rec2)).json;
+  const otherProp = booth.proposals.find((x) => x.id === attPid);
+  ok(Array.isArray(otherProp.attachments) && otherProp.attachments.length === 0,
+    '记录员在他人提议上只看到空附件集合（不获得他人元数据）');
+  const dlRec2 = await download(aid1, rec2);
+  ok(dlRec2.status === 403, '非本人记录员下载他人附件被拒绝（403）');
+  // 参与者：元数据、下载、下载地址全部不可得
+  booth = (await req('GET', '/api/booth', null, par)).json;
+  const parProp = booth.proposals.find((x) => x.id === attPid);
+  ok(parProp && parProp.attachments === undefined, '参与者总览中提议不含任何附件元数据字段');
+  const dlPar = await download(aid1, par);
+  ok(dlPar.status === 403, '参与者下载附件被拒绝（403）');
+  await expectFail(download(99999, par).then((r) => ({ status: r.status, json: { error: 'x' } })),
+    403, 'x', '参与者探测不存在附件 id 仍被 403（不泄露存在性）');
+
+  console.log('\n[依据文件：待复核期间删除误传，处理后冻结]');
+  // 非上传者不能删除；参与者/复核员均被角色拦截
+  await expectFail(req('DELETE', `/api/proposals/${attPid}/attachments/${aid1}`, null, rev),
+    403, '无权操作', '复核员尝试删除附件');
+  await expectFail(req('DELETE', `/api/proposals/${attPid}/attachments/${aid1}`, null, par),
+    403, '无权操作', '参与者尝试删除附件');
+  const del = await req('DELETE', `/api/proposals/${attPid}/attachments/${aid1}`, null, rec);
+  ok(del.status === 200, '上传者可在提议待复核时删除误传附件');
+  booth = (await req('GET', '/api/booth', null, rec)).json;
+  ok(!booth.proposals.find((x) => x.id === attPid).attachments.some((a) => a.id === aid1),
+    '删除后附件从集合中消失');
+  ok((await download(aid1, rec)).status === 404, '已删除附件不可再下载（404）');
+
+  // 再上传一个附件，随后采纳 → 冻结
+  const upFrozen = await upload(attPid, PNG, '冻结证据.png', rec);
+  assert.strictEqual(upFrozen.status, 201);
+  const aidFrozen = upFrozen.json.id;
+  await req('POST', `/api/proposals/${attPid}/adopt`, {}, rev);
+  await expectFail(upload(attPid, JPEG, 'after-adopt.jpg', rec)
+    .then((r) => ({ status: r.status, json: r.json })), 409, '冻结', '采纳后上传被拒绝（集合冻结）');
+  await expectFail(req('DELETE', `/api/proposals/${attPid}/attachments/${aidFrozen}`, null, rec),
+    409, '冻结', '采纳后删除附件被拒绝');
+  // 驳回/冲突/发布后的其余冻结状态由下方发布流程与专用提议覆盖
+
+  // 冻结后文件仍可被有权者下载，且内容不变
+  const dlFrozen = await download(aidFrozen, rev);
+  ok(dlFrozen.status === 200 && dlFrozen.bytes.equals(PNG), '冻结后附件原文仍可供复核员下载');
+
+  // 标记冲突即冻结：两个同段交叠提议，先采纳其一，再采纳其二 → 其二被标记冲突
+  const cfA = await req('POST', '/api/proposals',
+    { seg: attSeg.seg, start: 5, end: 6, replacement: '甲', basis: '冲突冻结A' }, rec);
+  const cfB = await req('POST', '/api/proposals',
+    { seg: attSeg.seg, start: 5, end: 6, replacement: '乙', basis: '冲突冻结B' }, rec);
+  assert.strictEqual(cfA.status === 201 && cfB.status === 201, true);
+  const cfAtt = await upload(cfB.json.id, JPEG, '冲突前照片.jpg', rec);
+  assert.strictEqual(cfAtt.status, 201);
+  await req('POST', `/api/proposals/${cfA.json.id}/adopt`, {}, rev);
+  const adCfB = await req('POST', `/api/proposals/${cfB.json.id}/adopt`, {}, rev);
+  ok(adCfB.json.markedConflict, `提议 #${cfB.json.id} 采纳时被标记冲突`);
+  await expectFail(upload(cfB.json.id, PNG, '冲突后.png', rec)
+    .then((r) => ({ status: r.status, json: r.json })), 409, '冻结', '标记冲突后上传被拒绝（集合冻结）');
+  await expectFail(req('DELETE', `/api/proposals/${cfB.json.id}/attachments/${cfAtt.json.id}`, null, rec),
+    409, '冻结', '标记冲突后删除附件被拒绝');
+  ok((await download(cfAtt.json.id, rev)).status === 200, '冲突提议的附件仍保留供复核员查阅');
+
+  console.log('\n[依据文件：随发布与历史决议保留，重启后可查阅；续提不继承]');
+  await clearGate(rev);
+  const pubAtt = await req('POST', '/api/publish', { note: '含依据文件的修订' }, rev);
+  ok(pubAtt.status === 201, '含附件提议随版发布');
+  const attVer = pubAtt.json.versionId;
+  // 已发布提议：上传/删除都被冻结
+  await expectFail(upload(attPid, PNG, 'after-publish.png', rec)
+    .then((r) => ({ status: r.status, json: r.json })), 409, '冻结', '发布后上传被拒绝');
+  await expectFail(req('DELETE', `/api/proposals/${attPid}/attachments/${aidFrozen}`, null, rec),
+    409, '冻结', '发布后删除被拒绝');
+
+  // 历史版本视图：工作人员可见决议涉及提议的附件（含校验信息），参与者不含该字段
+  const vAttStaff = (await req('GET', `/api/versions/${attVer}`, null, rev)).json;
+  const vAtts = vAttStaff.attachments.filter((a) => a.proposalId === attPid);
+  ok(vAtts.length === 5 && vAtts.some((a) => a.id === aidFrozen && a.sha256 === PNG_SHA) &&
+     !vAtts.some((a) => a.id === aid1),
+    `历史版本 v${attVer} 视图保留冻结附件（含实际 SHA-256），删除的误传附件不在其中`);
+  const vAttRec = (await req('GET', `/api/versions/${attVer}`, null, rec)).json;
+  ok(vAttRec.attachments.some((a) => a.id === aidFrozen), '记录员在历史版本可见本人附件');
+  const vAttRec2 = (await req('GET', `/api/versions/${attVer}`, null, rec2)).json;
+  ok(vAttRec2.attachments.filter((a) => a.proposalId === attPid).length === 0,
+    '非本人记录员在历史版本不获得他人附件');
+  const vAttPar = (await req('GET', `/api/versions/${attVer}`, null, par)).json;
+  ok(vAttPar.attachments === undefined, '历史视图对参与者不含附件字段（保密段及历史视图同权限）');
+
+  // 驳回即冻结：新建提议→驳回→上传被拒、附件仍保留可查
+  const rejP = await req('POST', '/api/proposals',
+    { seg: attSeg.seg, start: 1, end: 2, replacement: '？', basis: '驳回冻结测试' }, rec);
+  assert.strictEqual(rejP.status, 201);
+  const rejA = await upload(rejP.json.id, WAV, '驳回前录音.wav', rec);
+  assert.strictEqual(rejA.status, 201);
+  await req('POST', `/api/proposals/${rejP.json.id}/reject`, { reason: '证据不足' }, rev);
+  await expectFail(upload(rejP.json.id, MP3, '驳回后.mp3', rec)
+    .then((r) => ({ status: r.status, json: r.json })), 409, '冻结', '驳回后上传被拒绝（集合冻结）');
+  const rejDl = await download(rejA.json.id, rev);
+  ok(rejDl.status === 200 && rejDl.bytes.equals(WAV), '驳回提议的附件仍保留供复核员查阅');
+
+  console.log('\n[依据文件：重启后仍可查阅（持久化）]');
+  // 附件以 BLOB 与元数据同库存储：校验数据库内仍存在，且通过只读查询工具可重新读出原文。
+  // 服务进程持续运行即等价于重启后的读路径（同一数据库文件、无内存态）。
+  const dlPersist = await download(aidFrozen, rec);
+  ok(dlPersist.status === 200 && dlPersist.bytes.equals(PNG),
+    '发布后的附件原文持久保留，可随时下载（重启不影响，文件与元数据同库）');
+  const dbFile = require('path').join(process.env.DATA_DIR, 'hearing.sqlite');
+  {
+    const ro = new Database(dbFile, { readonly: true });
+    const row = ro.prepare('SELECT sha256, size_bytes, length(content) AS clen FROM proposal_attachments WHERE id=?').get(aidFrozen);
+    ok(row && row.sha256 === PNG_SHA && row.size_bytes === PNG.length && row.clen === PNG.length,
+      '数据库中保留附件实际 SHA-256、大小与完整原文（重启后仍在）');
+    ro.close();
+  }
+
+  console.log('\n[依据文件：续提新提议不自动继承旧附件]');
+  // 构造一个因发布而“基版已过期”的本人提议（带附件），续提后新提议附件为空
+  const rebSeg = booth.segments.length; // 最后一段（本轮测试未改动）
+  const lastText = booth.segments.find((s) => s.seg === rebSeg).text;
+  const rebP = await req('POST', '/api/proposals',
+    { seg: rebSeg, start: 0, end: Math.min(1, Array.from(lastText).length), replacement: '◆', basis: '续提附件测试' }, rec);
+  assert.strictEqual(rebP.status, 201);
+  const rebA = await upload(rebP.json.id, MP3, '旧依据.mp3', rec);
+  assert.strictEqual(rebA.status, 201);
+  // 在其他段发布一次，使 rebP 基版过期
+  const other = await req('POST', '/api/proposals',
+    { seg: attSeg.seg, start: 2, end: 3, replacement: '▪', basis: '使他提议过期' }, rec);
+  await req('POST', `/api/proposals/${other.json.id}/adopt`, {}, rev);
+  await clearGate(rev);
+  await req('POST', '/api/publish', { note: '使附件提议基版过期' }, rev);
+  booth = (await req('GET', '/api/booth', null, rec)).json;
+  ok(booth.proposals.find((x) => x.id === rebP.json.id).status === 'conflicted', '旧提议已标基版过期');
+  const rebPv = await req('POST', `/api/proposals/${rebP.json.id}/rebase-preview`, {}, rec);
+  assert.strictEqual(rebPv.status, 200);
+  const rebCf = await req('POST', `/api/proposals/${rebP.json.id}/rebase-confirm`, { token: rebPv.json.token }, rec);
+  assert.strictEqual(rebCf.status, 201);
+  const rebNewId = rebCf.json.id;
+  booth = (await req('GET', '/api/booth', null, rec)).json;
+  const rebNew = booth.proposals.find((x) => x.id === rebNewId);
+  ok(Array.isArray(rebNew.attachments) && rebNew.attachments.length === 0,
+    '续提生成的新提议不自动继承旧附件（需重新上传）');
+  // 原附件仍随旧（冲突）提议保留可查
+  const rebOldDl = await download(rebA.json.id, rev);
+  ok(rebOldDl.status === 200, '旧冲突提议的附件仍随历史记录保留');
+
+  console.log('\n[依据文件：保密段对参与者同样屏蔽附件]');
+  const secAttP = await req('POST', '/api/proposals',
+    { seg: attSeg.seg, start: 3, end: 4, replacement: '▲', basis: '保密段附件测试' }, rec);
+  assert.strictEqual(secAttP.status, 201);
+  const secAttA = await upload(secAttP.json.id, PDF, '保密材料.pdf', rec);
+  assert.strictEqual(secAttA.status, 201);
+  await req('POST', `/api/segments/${attSeg.seg}/secret`, {}, rev);
+  booth = (await req('GET', '/api/booth', null, par)).json;
+  ok(!booth.proposals.some((p) => p.seg === attSeg.seg),
+    '保密后：参与者看不到该段提议（自然也不获得附件元数据）');
+  ok((await download(secAttA.json.id, par)).status === 403, '保密段附件：参与者下载仍 403');
+  const secHist = (await req('GET', `/api/versions/${attVer}`, null, par)).json;
+  ok(secHist.attachments === undefined, '保密段历史视图：参与者仍不获得附件信息');
+  // 工作人员在保密期间仍可下载
+  ok((await download(secAttA.json.id, rev)).status === 200, '保密不影响工作人员查看附件');
+  await req('POST', `/api/segments/${attSeg.seg}/unsecret`, {}, rev);
 
   console.log(`\n全部通过：${passed} 项断言 ✅`);
   process.exit(0);

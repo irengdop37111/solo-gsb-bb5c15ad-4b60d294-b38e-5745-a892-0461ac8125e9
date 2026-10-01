@@ -3,6 +3,7 @@
 const assert = require('assert');
 const { codeLength, sliceCP, validateRange, applyEdits, transformRange, transformRangeRebase, editTouchesAnchor, replayProvenance } = require('../src/text');
 const { parseTranscript } = require('../src/store');
+const { detectMediaType, sha256Hex } = require('../src/attachments');
 
 let n = 0;
 const ok = (c, m) => { assert(c, m); n++; console.log('  ✓', m); };
@@ -168,5 +169,49 @@ tk = replayProvenance('甲乙', [
 ]);
 ok(tk.map((t) => t.ch).join('') === '甲RL乙' && tk[1].tag.proposalId === 2 && tk[2].tag.proposalId === 1,
   '来源重放：同点零长度插入按合版实际顺序归属（后应用的 #2 文本在左、#1 在右）');
+
+// ---------- 依据文件内容识别（detectMediaType：只认魔数，不认扩展名） ----------
+const PNG_1x1 = Buffer.from(
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==',
+  'base64'
+);
+let det = detectMediaType(PNG_1x1);
+ok(det && det.kind === 'PNG' && det.mediaType === 'image/png', '内容识别：1x1 PNG 按魔数识别为 PNG');
+
+det = detectMediaType(Buffer.from('%PDF-1.7\n%\xe2\xe3\xcf\xd3\nrestrestrest'));
+ok(det && det.kind === 'PDF' && det.mediaType === 'application/pdf', '内容识别：%PDF- 头识别为 PDF');
+
+// 最小 JPEG：SOI + EOI
+det = detectMediaType(Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0, 0x10, 0, 0, 0xff, 0xd9]));
+ok(det && det.kind === 'JPEG' && det.mediaType === 'image/jpeg', '内容识别：SOI/EOI 识别为 JPEG');
+
+// WAV：RIFF....WAVEfmt
+det = detectMediaType(Buffer.concat([Buffer.from('RIFF'), Buffer.alloc(4), Buffer.from('WAVEfmt '), Buffer.alloc(24)]));
+ok(det && det.kind === 'WAV' && det.mediaType === 'audio/wav', '内容识别：RIFF/WAVE/fmt 识别为 WAV');
+
+// MP3：ID3v2.3 标签头
+det = detectMediaType(Buffer.concat([Buffer.from('ID3'), Buffer.from([3, 0, 0]), Buffer.alloc(20, 0x00)]));
+ok(det && det.kind === 'MP3' && det.mediaType === 'audio/mpeg', '内容识别：ID3v2.3 标签头识别为 MP3');
+
+// MP3：裸帧同步 11 个 1，版本 11（MPEG1）、层 01（Layer III）
+det = detectMediaType(Buffer.from([0xff, 0xfb, 0x90, 0x00, ...Buffer.alloc(16, 0)]));
+ok(det && det.kind === 'MP3', '内容识别：MPEG 帧同步识别为裸 MP3');
+
+// 不能识别的内容
+ok(detectMediaType(Buffer.from('GIF89a fake')) === null, '内容识别：GIF（不在允许类型中）拒绝');
+ok(detectMediaType(Buffer.from('plain text')) === null, '内容识别：纯文本拒绝');
+ok(detectMediaType(Buffer.alloc(0)) === null, '内容识别：空内容拒绝');
+ok(detectMediaType(Buffer.from([0xff, 0xd8, 0xff])) === null,
+  '内容识别：有 JPEG 头但缺少 EOI 结尾（残缺文件）拒绝');
+ok(detectMediaType(Buffer.from([0xff, 0xe8, 0x90])) === null,
+  '内容识别：帧同步但 MPEG 版本为保留值时拒绝');
+// 伪装扩展名无效：PNG 内容不会因 .jpg 扩展名而放行——识别只看字节
+ok(detectMediaType(PNG_1x1).kind !== 'JPEG', '内容识别：不信扩展名/Content-Type，只看内容魔数');
+
+// SHA-256 与标准工具一致（空串与字节串）
+ok(sha256Hex(Buffer.alloc(0)) === 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855',
+  'sha256Hex：空内容摘要正确');
+ok(sha256Hex(Buffer.from('abc')) === 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad',
+  'sha256Hex：abc 摘要正确');
 
 console.log(`\n单元测试全部通过：${n} 项 ✅`);

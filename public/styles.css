@@ -485,6 +485,44 @@ body {
 }
 .ver-card .vid { font-weight: 700; }
 
+/* ---------- 依据文件（附件） ---------- */
+.attach-list { display: flex; flex-direction: column; gap: 6px; margin: 8px 0 2px; }
+.attach-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 6px 10px;
+  background: #f8f7f0;
+  font-size: 12.5px;
+}
+.attach-icon { font-size: 16px; }
+.attach-main { flex: 1; min-width: 0; }
+.attach-name {
+  font-weight: 600;
+  color: var(--primary-dark);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.attach-meta { color: var(--muted); font-size: 11.5px; word-break: break-all; }
+.attach-actions { display: flex; gap: 6px; flex-shrink: 0; }
+.attach-verify { color: #486a3a; font-size: 11.5px; }
+.attach-frozen { color: var(--muted); font-size: 11.5px; }
+.upload-drop {
+  border: 1px dashed var(--adopt-border);
+  border-radius: 6px;
+  padding: 12px;
+  text-align: center;
+  background: #f4f7ea;
+  margin-top: 6px;
+  cursor: pointer;
+  font-size: 13px;
+  color: var(--primary-dark);
+}
+.upload-drop:hover { background: #eaf0d8; }
+
 /* ---------- Toast ---------- */
 .toast {
   position: fixed;

@@ -48,9 +48,9 @@ SQLite 数据库保存在命名卷 `hearing-revision-data`（容器内 `/data/he
 
 | 角色 | 用户名 | 密码 | 可执行操作 |
 | --- | --- | --- | --- |
-| 记录员 | `recorder` | `recorder123` | 导入逐字稿、提交修订提议、只读查看发布核对 |
-| 复核员 | `reviewer` | `reviewer123` | 采纳/驳回提议、发布前回应被触及异议、发布新版本、重新定位异议、**按段号保密/解除保密** |
-| 参与者 | `participant` | `participant123` | 对原文范围提出异议、重新定位自己的异议（保密段除外）；保密段只看到占位 |
+| 记录员 | `recorder` | `recorder123` | 导入逐字稿、提交修订提议、为本人待复核提议上传/删除依据文件、只读查看发布核对 |
+| 复核员 | `reviewer` | `reviewer123` | 采纳/驳回提议、发布前回应被触及异议、发布新版本、重新定位异议、**按段号保密/解除保密**、查看全部依据文件 |
+| 参与者 | `participant` | `participant123` | 对原文范围提出异议、重新定位自己的异议（保密段除外）；保密段只看到占位；**不得取得依据文件元数据/内容/下载地址** |
 
 种子账户仅在数据库用户表为空时创建；可通过环境变量覆盖用户名与密码（见下文配置）。
 
@@ -94,6 +94,7 @@ npm test
 | `SEED_RECORDIST_USER` / `SEED_RECORDIST_PASS` | `recorder` / `recorder123` | 记录员种子账户 |
 | `SEED_REVIEWER_USER` / `SEED_REVIEWER_PASS` | `reviewer` / `reviewer123` | 复核员种子账户 |
 | `SEED_PARTICIPANT_USER` / `SEED_PARTICIPANT_PASS` | `participant` / `participant123` | 参与者种子账户 |
+| `ATTACHMENT_MAX_BYTES` | `20971520` | 单个依据文件的字节数上限（默认 20 MB，仅用于测试时调小） |
 
 > 安全提示：演示使用 HTTP 与种子密码。生产部署请置于 HTTPS 反向代理之后，并修改全部种子密码；
 > 种子账户仅在首次初始化（用户表为空）时生效。
@@ -108,6 +109,7 @@ npm test
    - 导入即发布**不可变的第 1 版**。全场只允许导入一次，重复导入返回 409 且不改变状态。
 2. **记录员在正文中拖选段内文字 → “提交修订提议”**，填写替换文字（空串表示删除，禁止换行跨段）与必填依据。
    - 提议**绑定提交时的已发布版本**（基版），并保存基版原文摘录快照。
+   - 记录员还可为**本人待复核（pending）**的提议上传**依据文件**（见下文第 9 节）。
 3. **复核员**在右侧“提议”面板或正文标记上：
    - **采纳**：进入发布暂存区；**驳回**：可附原因，已采纳的也可驳回移出暂存区。
    - 采纳时若与暂存区已采纳修订**范围交叠**，或提议**基版已过期**，该提议被标记为“冲突”并写明原因，**不覆盖任何其他修订**。
@@ -169,8 +171,27 @@ npm test
    - **解除保密后**参与者重新可见该段正文与相关记录；保密/解除均在数据库事务中执行，
      留痕**操作人、时间与前后状态**（`public → secret` / `secret → public`）。
    - 失败均明确拒绝且不改变状态：未知段号 → 404；重复保密/对未保密段解除 → 409；非复核员操作 → 403。
+9. **依据文件（提议附件，本轮新增）**：记录员可在提议卡片或详情弹窗中为**本人“待复核”提议**上传依据文件，
+   复核员可在提议详情与历史版本视图中查看并下载。
+   - **上传要求**：请求体为文件原始字节；同时提交**原名**（`X-Filename`，仅作展示）与
+     **预期 SHA-256**（`X-Sha256`，64 位十六进制）。仅接收**内容可识别**的
+     **PDF、PNG、JPEG、MP3 或 WAV**（按文件头魔数识别，**不以扩展名或客户端 Content-Type 为准**），
+     **单件不超过 20 MB**（`ATTACHMENT_MAX_BYTES` 可配）。
+   - **校验与记录**：服务端实算 SHA-256 并与预期摘要比对；**摘要不符 → 422 拒绝**。
+     原名只作展示；元数据记录**上传者、上传时间、实际大小与实际 SHA-256**。
+     上传失败、超限、类型不可识别、摘要不符或提议状态已变化时均明确报错，
+     **不产生可见的半成品或孤儿记录**（内容与元数据同库同事务落库）。
+   - **删除误传**：提议被处理前（仅 `pending` 期间），上传者本人可删除误传附件；
+     提议**一经采纳、驳回、标记冲突或发布，附件集合冻结**（不可再上传、不可删除），
+     **原文件随提议及历史决议保留，重启后仍可查阅**；**续提生成的新提议不自动继承旧附件**。
+   - **权限**：**复核员可查看全部附件；记录员只可查看本人上传的附件；参与者不得取得
+     附件元数据、内容或下载地址**（参与者响应中不出现附件字段、下载请求一律 403，
+     亦不泄露附件是否存在）；**保密段及历史版本视图同样遵守该权限**。
+   - **并发**：上传与复核并发时以**最终提议状态为准**（写库事务内复查状态）——
+     提议在上传落库前被采纳/驳回/标冲突的，上传 409 拒绝且不写入。
 
-所有失败场景（无权操作、非法字符范围、重复发布、重复导入、重复采纳/重定位等）均返回明确的
+所有失败场景（无权操作、非法字符范围、重复发布、重复导入、重复采纳/重定位、
+依据文件类型/摘要/大小不符等）均返回明确的
 HTTP 状态码与中文原因，且在数据库事务中执行——失败即回滚，不改变任何状态。
 
 ### 字符范围口径
@@ -195,6 +216,9 @@ HTTP 状态码与中文原因，且在数据库事务中执行——失败即回
 | `POST /api/proposals/:id/reject` | 复核员 | 驳回（可含 `reason`） |
 | `POST /api/proposals/:id/rebase-preview` | 记录员（本人） | 续提预览：把“基版已过期”冲突提议的选区逐版换算到当前正文，返回目标选区/摘录/原替换文字与依据及确认凭证 |
 | `POST /api/proposals/:id/rebase-confirm` | 记录员（本人） | 确认续提 `{token}`：校验凭证（版本与暂存区未变、选区未被触及、不与暂存区交叠）后生成关联原提议的新待复核提议 |
+| `POST /api/proposals/:id/attachments` | 记录员（本人） | **上传依据文件**：请求体为原始字节（`application/octet-stream`），头 `X-Filename`（原名·仅展示）与 `X-Sha256`（预期 SHA-256）；仅 PDF/PNG/JPEG/MP3/WAV 且 ≤20MB；仅本人 pending 提议，否则 403/409；摘要不符 422、超限 413、类型不可识别 422 |
+| `DELETE /api/proposals/:id/attachments/:aid` | 记录员（本人） | **删除误传附件**：仅上传者本人且提议仍 pending；冻结后 409 |
+| `GET /api/attachments/:aid` | 记录员（本人）、复核员 | **查看/下载依据文件原文**：复核员可取全部，记录员仅取本人；参与者一律 403（含探测不存在 id）；响应头含 `Content-Type` 与 `X-Attachment-Sha256`/`X-Attachment-Size` 校验信息 |
 | `POST /api/publish` | 复核员 | 合并暂存修订并发布新版本 |
 | `POST /api/objections` | 登录用户 | 对原文范围提出异议 `{seg,start,end,note}` |
 | `POST /api/objections/:id/relocate` | 提出者或复核员 | 对“待重新定位”的异议手动重定位 |
@@ -329,6 +353,63 @@ curl -s -b /tmp/par.cookie http://localhost:3000/api/versions/1/sources/7
 > 相邻边界、零长度纯插入与后续再次改写都能精确定位；服务端还会校验重放结果与该版不可变快照逐码点
 > 一致，不一致（数据损坏）时报错而非编造来源。
 
+### 依据文件调用示例（curl）
+
+上传走**原始字节请求体**（不使用 multipart，无需第三方库即可调用）：
+原名经 `X-Filename` 头（仅展示用），预期摘要经 `X-Sha256` 头提交。
+
+```bash
+# 1) 记录员登录
+curl -i -c /tmp/rec.cookie -X POST http://localhost:3000/api/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"recorder","password":"recorder123"}'
+
+# 2) 先有一个本人“待复核”提议（此处假设为 #41）
+#    POST /api/proposals 略；上传前在本机计算文件 SHA-256（Linux/macOS）
+SHA=$(sha256sum 现场录音.mp3 | cut -d' ' -f1)      # macOS 用 shasum -a 256
+
+# 3) 上传：内容可识别 + ≤20MB + 预期 SHA-256 一致才会落库
+curl -s -b /tmp/rec.cookie -X POST \
+  http://localhost:3000/api/proposals/41/attachments \
+  -H 'Content-Type: application/octet-stream' \
+  -H 'X-Filename: 现场录音（第3段）.mp3' \
+  -H "X-Sha256: $SHA" \
+  --data-binary @现场录音.mp3
+# {
+#   "ok": true, "id": 12, "proposalId": 41,
+#   "filename": "现场录音（第3段）.mp3",
+#   "size": 184320, "sha256": "9f0c…（服务端实算，与提交摘要一致）",
+#   "mediaKind": "MP3", "mediaType": "audio/mpeg" }
+
+# 4) 待复核期间删除误传附件（仅上传者本人、提议仍 pending）
+curl -s -b /tmp/rec.cookie -X DELETE \
+  http://localhost:3000/api/proposals/41/attachments/12
+# {"ok":true}
+
+# 5) 下载/预览（复核员可取全部；记录员仅取本人；参与者 403）
+#    响应头一并给出内容类型与校验信息：
+curl -s -b /tmp/rev.cookie -D - -o /tmp/evidence.mp3 \
+  http://localhost:3000/api/attachments/12
+# HTTP/1.1 200 OK
+# Content-Type: audio/mpeg
+# Content-Disposition: inline; filename="____.mp3"; filename*=UTF-8''%E7%8E%B0%E5%9C%BA…
+# X-Attachment-Id: 12
+# X-Attachment-Sha256: 9f0c…
+# X-Attachment-Size: 184320
+
+# 6) 失败场景：明确报错，且不产生半成品或孤儿记录
+#    类型不可识别（如把文本/可执行文件改名为 .pdf）→ 422 UNSUPPORTED_MEDIA
+#    SHA-256 不符 → 422 SHA256_MISMATCH（响应给出提交值与实算值）
+#    超过 20 MB → 413 FILE_TOO_LARGE（Content-Length 预检即拒绝，不读入正文）
+#    提议已采纳/驳回/冲突/发布 → 409 PROPOSAL_FROZEN（集合冻结，不接受上传/删除）
+#    非本人记录员上传/删除 → 403；参与者上传/下载（含探测不存在 id）→ 403
+```
+
+> 浏览器网页端在上传前用 Web Crypto（`crypto.subtle.digest('SHA-256', …)`）计算预期摘要，
+> 在非安全上下文（`http://内网地址`）下回退到页面内置的纯 JS SHA-256 实现（`public/sha256.js`）。
+> 附件元数据随 `GET /api/booth` 的提议对象（工作人员视角的 `attachments` 字段）与
+> `GET /api/versions/:id`（工作人员视角的 `attachments` 字段）返回；参与者响应不含该字段。
+
 ---
 
 ## 六、数据模型（SQLite）
@@ -350,6 +431,12 @@ curl -s -b /tmp/par.cookie http://localhost:3000/api/versions/1/sources/7
 - `secret_logs`：**保密/解除保密留痕**。记录段号、动作（`classify`/`declassify`）、操作人、
   时间与前后状态（`previous_state`/`new_state`），不可变追加。保密不更新任何版本与业务记录表，
   对参与者的屏蔽只在视图层按 `segment_secrets` 过滤。
+- `proposal_attachments`：**提议依据文件**。文件名（`filename`）只作展示；另存内容识别出的
+  媒体类型（`media_type`/`media_kind`：PDF/PNG/JPEG/MP3/WAV）、**实际大小 `size_bytes`**、
+  **服务端实算的 `sha256`**、上传者（`uploaded_by`）与上传时间，文件**原文以 BLOB `content`
+  与元数据同库同事务存储**（失败不产生半成品/孤儿；重启后仍可查阅）。行仅在提议 `pending`
+  期间可由上传者插入/删除；提议离开 `pending`（采纳/驳回/冲突/发布）后这些行即冻结，
+  随提议与历史决议永久保留；续提生成的新提议不引用、不复制旧附件。
 
 ---
 
@@ -366,12 +453,14 @@ curl -s -b /tmp/par.cookie http://localhost:3000/api/versions/1/sources/7
 │   ├── server.js            # Express 路由与错误出口
 │   ├── auth.js              # Cookie 会话与角色鉴权
 │   ├── db.js                # SQLite 连接、建表、种子账户
-│   ├── store.js             # 业务核心：导入/提议/复核/发布/续提/异议/版本视图/正文来源
+│   ├── store.js             # 业务核心：导入/提议/复核/发布/续提/异议/版本视图/正文来源/依据文件
+│   ├── attachments.js       # 依据文件：魔数识别（PDF/PNG/JPEG/MP3/WAV）、大小上限、SHA-256
 │   └── text.js              # 码点偏移、范围校验、合版、引用映射、续提换算、来源重放
 ├── public                   # 浏览器前端（原生 HTML/CSS/JS，无构建步骤）
 │   ├── index.html
 │   ├── styles.css
-│   └── app.js
+│   ├── app.js
+│   └── sha256.js            # 上传前浏览器端 SHA-256（crypto.subtle 优先，纯 JS 兜底）
 └── test
     ├── unit.test.js         # 文本算子与解析的单元测试
     └── e2e.test.js          # 临时库 + 真实 HTTP 的端到端测试
